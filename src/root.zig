@@ -12,6 +12,33 @@ const host_policy = @import("policy.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
+/// Maximum stdin bytes admitted to one process or durable job.
+pub const max_stdin_bytes = process.max_stdin_bytes;
+/// Maximum retained stdout or stderr bytes for one synchronous process.
+pub const max_stream_bytes = process.max_stream_bytes;
+/// Maximum argv entries admitted to one process.
+pub const max_arguments = process.max_arguments;
+/// Maximum combined argv bytes admitted to one process.
+pub const max_argv_bytes = process.max_argv_bytes;
+/// Maximum durable-job lifetime.
+pub const max_job_timeout_seconds = jobs.max_timeout_seconds;
+/// Minimum durable-job output retention ceiling.
+pub const min_job_output_limit_bytes = jobs.min_output_limit_bytes;
+/// Maximum durable-job output retention ceiling.
+pub const max_job_output_limit_bytes = jobs.max_output_limit_bytes;
+/// Maximum number of native systemd resource-control properties on one durable job.
+pub const max_job_systemd_properties = jobs.max_systemd_properties;
+/// Maximum bytes in one native systemd resource-control property.
+pub const max_job_systemd_property_bytes = jobs.max_systemd_property_bytes;
+/// Minimum combined durable-job read size.
+pub const min_job_read_bytes = jobs.min_read_bytes;
+/// Maximum combined durable-job read size.
+pub const max_job_read_bytes = jobs.max_read_bytes;
+/// Durable job state shared with consumers that describe tool output schemas.
+pub const JobState = jobs.JobState;
+/// Durable job cancellation reason shared with consumers that describe tool output schemas.
+pub const JobCancelReason = jobs.CancelReason;
+
 /// Maximum PNG/JPEG bytes admitted to one native MCP image result.
 pub const max_image_bytes: usize = 8 * 1024 * 1024;
 /// Default lifetime for one synchronous command or shell call.
