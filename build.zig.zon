@@ -1,6 +1,6 @@
 .{
     .name = .workstation_tools,
-    .version = "0.1.2",
+    .version = "0.1.3",
     .fingerprint = 0xea559102eaef165b,
     .minimum_zig_version = "0.17.0-dev.1980+e78ea8f2c",
     .dependencies = .{},

@@ -459,18 +459,77 @@ fn validHex(value: []const u8, expected_len: usize, lowercase_only: bool) bool {
 
 /// Validates the bounded PNG/JPEG byte shapes admitted by the public `image_read` operation.
 pub fn validImageBytes(mime: []const u8, bytes: []const u8) bool {
-    if (std.mem.eql(u8, mime, "image/png")) {
-        const signature = "\x89PNG\r\n\x1a\n";
-        if (bytes.len < 33 or !std.mem.eql(u8, bytes[0..signature.len], signature)) return false;
-        if (!std.mem.eql(u8, bytes[8..16], "\x00\x00\x00\x0dIHDR")) return false;
-        if (std.mem.allEqual(u8, bytes[16..20], 0) or std.mem.allEqual(u8, bytes[20..24], 0)) return false;
-        return bytes[26] == 0 and bytes[27] == 0 and bytes[28] <= 1;
-    }
+    if (std.mem.eql(u8, mime, "image/png")) return validPng(bytes);
     if (std.mem.eql(u8, mime, "image/jpeg")) {
         return bytes.len >= 5 and std.mem.eql(u8, bytes[0..3], "\xff\xd8\xff") and
             std.mem.eql(u8, bytes[bytes.len - 2 ..], "\xff\xd9");
     }
     return false;
+}
+
+fn validPng(bytes: []const u8) bool {
+    const signature = "\x89PNG\r\n\x1a\n";
+    if (bytes.len < signature.len + 12 or !std.mem.eql(u8, bytes[0..signature.len], signature)) return false;
+
+    var offset: usize = signature.len;
+    var color_type: u8 = 0xff;
+    var saw_palette = false;
+    var saw_image_data = false;
+    var image_data_closed = false;
+    while (offset < bytes.len) {
+        if (bytes.len - offset < 12) return false;
+        const length: usize = @intCast(std.mem.readInt(u32, bytes[offset..][0..4], .big));
+        if (length > bytes.len - offset - 12) return false;
+        const type_start = offset + 4;
+        const data_start = offset + 8;
+        const data_end = data_start + length;
+        const chunk_end = data_end + 4;
+        const kind = bytes[type_start..data_start];
+        if (!validPngChunkType(kind)) return false;
+        const expected_crc = std.mem.readInt(u32, bytes[data_end..][0..4], .big);
+        if (std.hash.Crc32.hash(bytes[type_start..data_end]) != expected_crc) return false;
+
+        if (offset == signature.len) {
+            if (!std.mem.eql(u8, kind, "IHDR") or length != 13) return false;
+            if (std.mem.readInt(u32, bytes[data_start..][0..4], .big) == 0 or
+                std.mem.readInt(u32, bytes[data_start + 4 ..][0..4], .big) == 0) return false;
+            const bit_depth = bytes[data_start + 8];
+            color_type = bytes[data_start + 9];
+            if (!validPngBitDepth(color_type, bit_depth)) return false;
+            if (bytes[data_start + 10] != 0 or bytes[data_start + 11] != 0 or bytes[data_start + 12] > 1) return false;
+        } else if (std.mem.eql(u8, kind, "IHDR")) {
+            return false;
+        } else if (std.mem.eql(u8, kind, "PLTE")) {
+            if (saw_palette or saw_image_data or length == 0 or length > 768 or length % 3 != 0) return false;
+            if (color_type == 0 or color_type == 4) return false;
+            saw_palette = true;
+        } else if (std.mem.eql(u8, kind, "IDAT")) {
+            if (image_data_closed or (color_type == 3 and !saw_palette)) return false;
+            saw_image_data = true;
+        } else if (std.mem.eql(u8, kind, "IEND")) {
+            return length == 0 and saw_image_data and chunk_end == bytes.len;
+        } else {
+            if ((kind[0] & 0x20) == 0) return false;
+            if (saw_image_data) image_data_closed = true;
+        }
+        offset = chunk_end;
+    }
+    return false;
+}
+
+fn validPngChunkType(kind: []const u8) bool {
+    if (kind.len != 4 or (kind[2] & 0x20) != 0) return false;
+    for (kind) |byte| if (!std.ascii.isAlphabetic(byte)) return false;
+    return true;
+}
+
+fn validPngBitDepth(color_type: u8, bit_depth: u8) bool {
+    return switch (color_type) {
+        0 => bit_depth == 1 or bit_depth == 2 or bit_depth == 4 or bit_depth == 8 or bit_depth == 16,
+        2, 4, 6 => bit_depth == 8 or bit_depth == 16,
+        3 => bit_depth == 1 or bit_depth == 2 or bit_depth == 4 or bit_depth == 8,
+        else => false,
+    };
 }
 
 fn onlyArguments(arguments: std.json.ObjectMap, allowed: []const []const u8) Error!void {
@@ -908,21 +967,29 @@ test "image read distinguishes missing read and size failures" {
     try std.testing.expectError(error.InvalidImageData, imageRead(context, arguments));
 }
 
-test "image byte admission rejects suffix-only and mismatched formats" {
+test "image byte admission rejects corrupt PNG chunks and mismatched formats" {
     try std.testing.expect(!validImageBytes("image/png", "this is not png"));
     try std.testing.expect(!validImageBytes("image/jpeg", "this is not jpeg"));
     try std.testing.expect(!validImageBytes("image/png", "\xff\xd8\xff\xd9"));
     try std.testing.expect(validImageBytes("image/jpeg", "\xff\xd8\xff\xe0\xff\xd9"));
 
-    var png: [33]u8 = @splat(0);
-    @memcpy(png[0..16], "\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR");
-    png[19] = 1;
-    png[23] = 1;
-    png[24] = 8;
-    png[25] = 2;
-    try std.testing.expect(validImageBytes("image/png", &png));
-    png[27] = 1;
-    try std.testing.expect(!validImageBytes("image/png", &png));
+    const valid_b64 =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAAIGNIUk0AAHomAACAhAAA+gAAAIDoAAB1MAAA6mAAADqYAAAXcJy6UTwA" ++
+        "AAAGYktHRAD/AP8A/6C9p5MAAAAHdElNRQfqCQwIHhj187m8AAAAJXRFWHRkYXRlOmNyZWF0ZQAyMDI2LTA5LTEyVDA4OjMwOjI0Kz" ++
+        "AwOjAw1aPZjQAAACV0RVh0ZGF0ZTptb2RpZnkAMjAyNi0wOS0xMlQwODozMDoyNCswMDowMKT+YTEAAAAodEVYdGRhdGU6dGltZXN0" ++
+        "YW1wADIwMjYtMDktMTJUMDg6MzA6MjQrMDA6MDDz60DuAAAADElEQVQI12P4//8/AAX+Av7czFnnAAAAAElFTkSuQmCC";
+    var valid_storage: [512]u8 = undefined;
+    const valid_len = try std.base64.standard.Decoder.calcSizeForSlice(valid_b64);
+    try std.base64.standard.Decoder.decode(valid_storage[0..valid_len], valid_b64);
+    try std.testing.expect(validImageBytes("image/png", valid_storage[0..valid_len]));
+
+    const corrupt_b64 =
+        "iVBORw0KGgoAAAANSUhEUgAAAEAAAAAgCAIAAAAt/+nTAAAACXBIWXMAAAsTAAALEwEAmpwYAAAARElEQVR4nO3PQQ0AIBDAsAP/nuGNAvZoFSz" ++
+        "ZOjNnyNi1dwfgUQCeBMBJAJ4EwEkAngTASQCeBMBJAJ4EwEkAngTASQCeBMBJAF4ZAgE/3vT3AAAAAElFTkSuQmCC";
+    var corrupt_storage: [256]u8 = undefined;
+    const corrupt_len = try std.base64.standard.Decoder.calcSizeForSlice(corrupt_b64);
+    try std.base64.standard.Decoder.decode(corrupt_storage[0..corrupt_len], corrupt_b64);
+    try std.testing.expect(!validImageBytes("image/png", corrupt_storage[0..corrupt_len]));
 }
 
 test "workstation shell guard cannot persist Bash history" {
