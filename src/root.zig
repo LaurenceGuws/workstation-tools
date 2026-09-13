@@ -57,6 +57,7 @@ pub const max_shell_command_bytes: usize =
 
 /// Host execution policy supplied by the embedding application or transport.
 pub const Policy = host_policy.Policy;
+pub const EnvironmentSource = host_policy.EnvironmentSource;
 /// Optional environment marker supplied by host policy.
 pub const Marker = environment.Marker;
 
