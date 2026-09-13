@@ -348,7 +348,12 @@ pub fn run(init: std.process.Init, policy: host_policy.Policy, job_dir: []const 
             .limited(process.max_stdin_bytes),
         ) catch return error.InvalidJob;
     }
-    var child_env = try environment.current(init, init.gpa, policy.operator_marker);
+    var child_env = try environment.current(
+        init,
+        init.gpa,
+        policy.environment_source,
+        policy.operator_marker,
+    );
     defer child_env.deinit();
     if (policy.agent_marker) |marker| try child_env.put(marker.name, marker.value);
     var child_argv = stored.argv;

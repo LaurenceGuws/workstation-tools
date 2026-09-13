@@ -224,7 +224,12 @@ fn runProcess(
     if (timeout_seconds > max_process_timeout_seconds) return error.InvalidArguments;
     const stdin = try optionalString(arguments, "stdin");
 
-    var child_env = try environment.current(context.init, context.init.gpa, context.policy.operator_marker);
+    var child_env = try environment.current(
+        context.init,
+        context.init.gpa,
+        context.policy.environment_source,
+        context.policy.operator_marker,
+    );
     defer child_env.deinit();
     if (context.policy.agent_marker) |marker| try child_env.put(marker.name, marker.value);
     if (operator_login) if (context.policy.operator_marker) |marker| try child_env.put(marker.name, marker.value);

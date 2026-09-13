@@ -9,9 +9,11 @@ pub const max_shell_prelude_bytes: usize = 62;
 pub const max_job_unit_prefix_bytes: usize = 32;
 /// Maximum executable role argument bytes used by durable job helpers.
 pub const max_job_role_argument_bytes: usize = 64;
+pub const EnvironmentSource = environment.Source;
 
 /// Host-selected execution policy. Empty optional markers mean no environment marker is injected.
 pub const Policy = struct {
+    environment_source: EnvironmentSource = .user_manager,
     agent_marker: ?environment.Marker = null,
     operator_marker: ?environment.Marker = null,
     shell_prelude: []const u8 = "declare -xr HISTFILE=/dev/null;set +o history;",

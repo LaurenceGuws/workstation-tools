@@ -13,6 +13,14 @@ const Environ = std.process.Environ;
 const systemctl = "/usr/bin/systemctl";
 const query_timeout = Io.Duration.fromSeconds(2);
 
+/// Host-selected source for the environment inherited by workstation payloads.
+/// Desktop/long-lived services normally use the user manager; isolated runtimes
+/// such as containers may deliberately use their own process environment.
+pub const Source = enum {
+    user_manager,
+    process,
+};
+
 /// Optional environment marker used only while resolving the login-shell environment.
 pub const Marker = struct { name: []const u8, value: []const u8 };
 var process_environment_mutex: Io.Mutex = .init;
@@ -25,51 +33,23 @@ pub const Error = process.Error || error{
     CommandNotFound,
 };
 
-/// Builds one owned child environment from the current systemd user-manager environment.
+/// Builds one owned child environment from the host-selected source and then
+/// normalizes it through the same bounded login-shell snapshot.
 ///
-/// Stable identity fields fall back to the host process only when the manager does not publish them. Session-scoped graphical
-/// fields intentionally do not fall back: absence in the manager means the current session does not own them.
-pub fn current(init: std.process.Init, allocator: Allocator, operator_marker: ?Marker) Error!Environ.Map {
-    var observed = try process.run(
-        init.gpa,
-        init.io,
-        &.{ systemctl, "--user", "show-environment" },
-        "/",
-        null,
-        query_timeout,
-        null,
-    );
-    defer observed.deinit(init.gpa);
-    if (observed.timed_out or observed.term == null or !termSucceeded(observed.term.?) or observed.truncated) {
-        return error.SessionEnvironmentUnavailable;
-    }
-
-    var env = Environ.Map.init(allocator);
-    errdefer env.deinit();
-    try parseManagerEnvironment(&env, observed.stdout);
-
-    // These are stable process/user facts, not graphical-session authority. Keep command execution useful on a minimal
-    // headless user manager while still allowing a published manager value to win.
-    const fallback_keys = [_][]const u8{
-        "HOME",
-        "USER",
-        "LOGNAME",
-        "SHELL",
-        "LANG",
-        "PATH",
-        "DBUS_SESSION_BUS_ADDRESS",
-        "SSH_AUTH_SOCK",
-        "XDG_RUNTIME_DIR",
+/// Under `user_manager`, stable identity fields fall back to the host process
+/// only when the manager does not publish them. Session-scoped graphical fields
+/// intentionally do not fall back. Under `process`, the embedding process owns
+/// the complete starting environment explicitly.
+pub fn current(init: std.process.Init, allocator: Allocator, source: Source, operator_marker: ?Marker) Error!Environ.Map {
+    var env = switch (source) {
+        .user_manager => try managerEnvironment(init, allocator),
+        .process => blk: {
+            process_environment_mutex.lockUncancelable(init.io);
+            defer process_environment_mutex.unlock(init.io);
+            break :blk init.environ_map.clone(allocator) catch return error.OutOfMemory;
+        },
     };
-    {
-        process_environment_mutex.lockUncancelable(init.io);
-        defer process_environment_mutex.unlock(init.io);
-        for (fallback_keys) |key| {
-            if (env.get(key) == null) {
-                if (init.environ_map.get(key)) |value| try env.put(key, value);
-            }
-        }
-    }
+    errdefer env.deinit();
     if (env.get("HOME") == null or env.get("PATH") == null) return error.InvalidSessionEnvironment;
 
     // Keep the login-shell environment probe completely outside the user's interactive history from process start.
@@ -111,6 +91,48 @@ pub fn current(init: std.process.Init, allocator: Allocator, operator_marker: ?M
     }
     env.deinit();
     return shell_env;
+}
+
+fn managerEnvironment(init: std.process.Init, allocator: Allocator) Error!Environ.Map {
+    var observed = try process.run(
+        init.gpa,
+        init.io,
+        &.{ systemctl, "--user", "show-environment" },
+        "/",
+        null,
+        query_timeout,
+        null,
+    );
+    defer observed.deinit(init.gpa);
+    if (observed.timed_out or observed.term == null or !termSucceeded(observed.term.?) or observed.truncated) {
+        return error.SessionEnvironmentUnavailable;
+    }
+
+    var env = Environ.Map.init(allocator);
+    errdefer env.deinit();
+    try parseManagerEnvironment(&env, observed.stdout);
+
+    // These are stable process/user facts, not graphical-session authority. Keep command execution useful on a minimal
+    // headless user manager while still allowing a published manager value to win.
+    const fallback_keys = [_][]const u8{
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "LANG",
+        "PATH",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "SSH_AUTH_SOCK",
+        "XDG_RUNTIME_DIR",
+    };
+    process_environment_mutex.lockUncancelable(init.io);
+    defer process_environment_mutex.unlock(init.io);
+    for (fallback_keys) |key| {
+        if (env.get(key) == null) {
+            if (init.environ_map.get(key)) |value| try env.put(key, value);
+        }
+    }
+    return env;
 }
 
 fn parseManagerEnvironment(env: *Environ.Map, bytes: []const u8) Error!void {
@@ -226,4 +248,26 @@ test "child PATH resolution prefers the supplied session environment" {
         error.CommandNotFound,
         resolveExecutable(std.testing.io, std.testing.allocator, &env, root, "missing-command"),
     );
+}
+
+test "process environment source preserves explicit host environment without user manager" {
+    var map = Environ.Map.init(std.testing.allocator);
+    defer map.deinit();
+    try map.put("HOME", "/tmp");
+    try map.put("PATH", "/usr/bin:/bin");
+    try map.put("WORKSTATION_SOURCE_CANARY", "process-owned");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const init: std.process.Init = .{
+        .minimal = undefined,
+        .arena = &arena,
+        .gpa = std.testing.allocator,
+        .io = std.testing.io,
+        .environ_map = &map,
+        .preopens = undefined,
+    };
+    var env = try current(init, std.testing.allocator, .process, null);
+    defer env.deinit();
+    try std.testing.expectEqualStrings("process-owned", env.get("WORKSTATION_SOURCE_CANARY").?);
+    try std.testing.expectEqualStrings("/dev/null", env.get("HISTFILE").?);
 }
