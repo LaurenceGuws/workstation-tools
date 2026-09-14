@@ -1,7 +1,9 @@
 //! Owns durable background jobs behind one explicit host-selected backend.
 //!
-//! The systemd backend delegates lifetime and cgroup control to transient user services. The process backend owns a small
-//! detached supervisor. Both retain bounded streams and durable receipts so observation is independent of the initiating call.
+//! Current job execution is Linux-only. The systemd backend delegates lifetime and cgroup control to transient user services;
+//! the process backend is the smaller `/proc` + process-group supervisor used when systemd is not the selected host facility.
+//! Both retain bounded streams and durable receipts. Future OS work should preserve this start/read/cancel surface rather than
+//! pretending the current Linux mechanics are already portable.
 
 const std = @import("std");
 const environment = @import("environment.zig");
