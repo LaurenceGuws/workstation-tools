@@ -580,7 +580,12 @@ fn runProcessSupervisor(
     });
     std.debug.assert(child.stdout != null);
     std.debug.assert(child.stderr != null);
-    if (exists(init.io, job_dir, "cancelled")) try signalProcessGroup(child_pid, .TERM);
+    if (exists(init.io, job_dir, "cancelled")) {
+        signalProcessGroup(child_pid, .TERM) catch |failure| switch (failure) {
+            error.ProcessNotFound => {},
+            else => return error.JobControlFailed,
+        };
+    }
 
     var input_task = if (stdin_bytes) |bytes| task: {
         std.debug.assert(child.stdin != null);
