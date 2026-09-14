@@ -58,6 +58,7 @@ pub const max_shell_command_bytes: usize =
 /// Host execution policy supplied by the embedding application or transport.
 pub const Policy = host_policy.Policy;
 pub const EnvironmentSource = host_policy.EnvironmentSource;
+pub const JobBackend = host_policy.JobBackend;
 /// Optional environment marker supplied by host policy.
 pub const Marker = environment.Marker;
 
@@ -145,6 +146,17 @@ pub fn description(tool: Tool) []const u8 {
     };
 }
 
+/// Returns the model description after applying host-selected backend details.
+pub fn descriptionForPolicy(policy: Policy, tool: Tool) []const u8 {
+    if (policy.job_backend != .process) return description(tool);
+    return switch (tool) {
+        .job_start => "Start one bounded long-running argv and return a durable job ID. The host supervisor owns lifetime, " ++
+            "timeouts, bounded output, and terminal evidence.",
+        .job_cancel => "Request cancellation of one running durable job through the host supervisor.",
+        else => description(tool),
+    };
+}
+
 /// Rejects malformed known-tool arguments before workstation activity admission.
 pub fn validateArguments(tool: Tool, arguments: std.json.ObjectMap) Error!void {
     switch (tool) {
@@ -195,6 +207,14 @@ pub fn validateArguments(tool: Tool, arguments: std.json.ObjectMap) Error!void {
             try onlyArguments(arguments, &.{"job_id"});
             try validateJobId(arguments);
         },
+    }
+}
+
+/// Rejects backend-specific arguments that are not available on this embedding host.
+pub fn validateArgumentsForPolicy(policy: Policy, tool: Tool, arguments: std.json.ObjectMap) Error!void {
+    try validateArguments(tool, arguments);
+    if (policy.job_backend == .process and tool == .job_start and arguments.contains("systemd_properties")) {
+        return error.InvalidArguments;
     }
 }
 
@@ -365,13 +385,15 @@ fn metaValue(allocator: Allocator, meta: jobs.Meta) Error!std.json.Value {
     var output = object();
     try put(allocator, &output, "job_id", .{ .string = meta.job_id });
     try put(allocator, &output, "state", .{ .string = @tagName(meta.state) });
-    try put(allocator, &output, "unit", .{ .string = meta.unit });
+    if (meta.unit) |unit| try put(allocator, &output, "unit", .{ .string = unit });
     try put(allocator, &output, "argv", try argvValue(allocator, meta.argv));
     try put(allocator, &output, "created_at", .{ .integer = meta.created_at });
     try put(allocator, &output, "cwd", .{ .string = meta.cwd });
     try put(allocator, &output, "timeout_seconds", .{ .integer = meta.timeout_seconds });
     try put(allocator, &output, "output_limit_bytes", .{ .integer = @intCast(meta.output_limit_bytes) });
-    try put(allocator, &output, "systemd_properties", try argvValue(allocator, meta.systemd_properties));
+    if (meta.unit != null) {
+        try put(allocator, &output, "systemd_properties", try argvValue(allocator, meta.systemd_properties));
+    }
     try put(allocator, &output, "stdout_truncated", .{ .bool = meta.stdout_truncated });
     try put(allocator, &output, "stderr_truncated", .{ .bool = meta.stderr_truncated });
     if (meta.exit_code) |value| try put(allocator, &output, "exit_code", .{ .integer = value });
@@ -614,6 +636,11 @@ pub fn runJob(init: std.process.Init, policy: Policy, job_dir: []const u8) Error
     return jobs.run(init, policy, job_dir);
 }
 
+/// Starts one detached process-backend supervisor through the consumer executable.
+pub fn launchJob(init: std.process.Init, policy: Policy, job_dir: []const u8) Error!void {
+    return jobs.launch(init, policy, job_dir);
+}
+
 /// Writes one durable job terminal receipt using the embedding host policy.
 pub fn finishJob(init: std.process.Init, policy: Policy, job_dir: []const u8) Error!void {
     return jobs.finish(init, policy, job_dir);
@@ -722,6 +749,36 @@ pub fn inputSchemaJson(tool: Tool) []const u8 {
     };
 }
 
+/// Returns the exact input schema after applying host-selected backend capabilities.
+pub fn inputSchemaJsonForPolicy(policy: Policy, tool: Tool) []const u8 {
+    if (policy.job_backend == .process and tool == .job_start) return processJobStartSchemaJson();
+    return inputSchemaJson(tool);
+}
+
+fn processJobStartSchemaJson() []const u8 {
+    return
+    \\{
+    \\  "type": "object",
+    \\  "properties": {
+    \\    "argv": {
+    \\      "type": "array", "minItems": 1, "maxItems": 256,
+    \\      "items": {"type": "string", "minLength": 1, "maxLength": 32768},
+    \\      "description": "Combined argv bytes must not exceed 32768."
+    \\    },
+    \\    "cwd": {
+    \\      "type": "string", "minLength": 1, "maxLength": 4096,
+    \\      "description": "Existing target directory. Start with '.'; do not infer /home/<node> from the node label."
+    \\    },
+    \\    "stdin": {"type": ["string", "null"], "maxLength": 131072},
+    \\    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 86400},
+    \\    "output_limit_bytes": {"type": "integer", "minimum": 4096, "maximum": 536870912}
+    \\  },
+    \\  "required": ["argv", "cwd"],
+    \\  "additionalProperties": false
+    \\}
+    ;
+}
+
 /// Returns the transport-neutral JSON success schema owned by one workstation tool.
 pub fn outputSchemaJson(tool: Tool) []const u8 {
     return switch (tool) {
@@ -753,6 +810,17 @@ pub fn outputSchemaJson(tool: Tool) []const u8 {
         .job_start => jobMetaSchemaJson(),
         .job_read => jobReadSchemaJson(),
         .job_cancel => jobCancelSchemaJson(),
+    };
+}
+
+/// Returns the exact success schema after applying host-selected backend details.
+pub fn outputSchemaJsonForPolicy(policy: Policy, tool: Tool) []const u8 {
+    if (policy.job_backend != .process) return outputSchemaJson(tool);
+    return switch (tool) {
+        .job_start => processJobMetaSchemaJson(),
+        .job_read => processJobReadSchemaJson(),
+        .job_cancel => processJobCancelSchemaJson(),
+        else => outputSchemaJson(tool),
     };
 }
 
@@ -849,14 +917,115 @@ fn jobCancelSchemaJson() []const u8 {
     ;
 }
 
+fn processJobMetaSchemaJson() []const u8 {
+    return
+    \\{
+    \\  "type": "object",
+    \\  "properties": {
+    \\    "job_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+    \\    "state": {"enum": ["starting", "running", "stopping", "exited", "timed_out", "cancelled", "failed", "indeterminate"]},
+    \\    "argv": {"type": "array", "minItems": 1, "maxItems": 256, "items": {"type": "string", "minLength": 1, "maxLength": 32768}},
+    \\    "cwd": {"type": "string", "minLength": 1, "maxLength": 4096},
+    \\    "created_at": {"type": "integer"},
+    \\    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 86400},
+    \\    "output_limit_bytes": {"type": "integer", "minimum": 4096, "maximum": 536870912},
+    \\    "stdout_truncated": {"type": "boolean"},
+    \\    "stderr_truncated": {"type": "boolean"},
+    \\    "exit_code": {"type": "integer"},
+    \\    "ended_at": {"type": "integer"}
+    \\  },
+    \\  "required": ["job_id", "state", "argv", "cwd", "created_at", "timeout_seconds",
+    \\    "output_limit_bytes", "stdout_truncated", "stderr_truncated"],
+    \\  "additionalProperties": false
+    \\}
+    ;
+}
+
+fn processJobReadSchemaJson() []const u8 {
+    return
+    \\{
+    \\  "type": "object",
+    \\  "properties": {
+    \\    "job_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+    \\    "state": {"enum": ["starting", "running", "stopping", "exited", "timed_out", "cancelled", "failed", "indeterminate"]},
+    \\    "argv": {"type": "array", "minItems": 1, "maxItems": 256, "items": {"type": "string", "minLength": 1, "maxLength": 32768}},
+    \\    "cwd": {"type": "string", "minLength": 1, "maxLength": 4096},
+    \\    "created_at": {"type": "integer"},
+    \\    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 86400},
+    \\    "output_limit_bytes": {"type": "integer", "minimum": 4096, "maximum": 536870912},
+    \\    "stdout_truncated": {"type": "boolean"}, "stderr_truncated": {"type": "boolean"},
+    \\    "exit_code": {"type": "integer"}, "ended_at": {"type": "integer"},
+    \\    "stdout": {"type": "string", "maxLength": 32768},
+    \\    "stderr": {"type": "string", "maxLength": 32768},
+    \\    "stdout_offset": {"type": "integer", "minimum": 0},
+    \\    "stderr_offset": {"type": "integer", "minimum": 0},
+    \\    "next_stdout_offset": {"type": "integer", "minimum": 0},
+    \\    "next_stderr_offset": {"type": "integer", "minimum": 0},
+    \\    "stdout_eof": {"type": "boolean"}, "stderr_eof": {"type": "boolean"}
+    \\  },
+    \\  "required": ["job_id", "state", "argv", "cwd", "created_at", "timeout_seconds",
+    \\    "output_limit_bytes", "stdout_truncated", "stderr_truncated", "stdout", "stderr", "stdout_offset",
+    \\    "stderr_offset", "next_stdout_offset", "next_stderr_offset", "stdout_eof", "stderr_eof"],
+    \\  "additionalProperties": false
+    \\}
+    ;
+}
+
+fn processJobCancelSchemaJson() []const u8 {
+    return
+    \\{
+    \\  "type": "object",
+    \\  "properties": {
+    \\    "job_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+    \\    "state": {"enum": ["starting", "running", "stopping", "exited", "timed_out", "cancelled", "failed", "indeterminate"]},
+    \\    "argv": {"type": "array", "minItems": 1, "maxItems": 256, "items": {"type": "string", "minLength": 1, "maxLength": 32768}},
+    \\    "cwd": {"type": "string", "minLength": 1, "maxLength": 4096},
+    \\    "created_at": {"type": "integer"},
+    \\    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 86400},
+    \\    "output_limit_bytes": {"type": "integer", "minimum": 4096, "maximum": 536870912},
+    \\    "stdout_truncated": {"type": "boolean"}, "stderr_truncated": {"type": "boolean"},
+    \\    "exit_code": {"type": "integer"}, "ended_at": {"type": "integer"},
+    \\    "cancelled": {"type": "boolean"},
+    \\    "reason": {"enum": ["already_finished", "stop_requested"]}
+    \\  },
+    \\  "required": ["job_id", "state", "argv", "cwd", "created_at", "timeout_seconds",
+    \\    "output_limit_bytes", "stdout_truncated", "stderr_truncated", "cancelled", "reason"],
+    \\  "additionalProperties": false
+    \\}
+    ;
+}
+
 const test_policy = Policy{
     .agent_marker = .{ .name = "AGENT_CHILD", .value = "1" },
     .operator_marker = .{ .name = "OPERATOR_PROFILE", .value = "1" },
     .shell_prelude = "unset OPERATOR_PROFILE;HISTFILE=/dev/null;set +o history;",
     .job_unit_prefix = "workstation-job-",
+    .job_launch_argument = "--job-launch",
     .job_run_argument = "--job-run",
     .job_finish_argument = "--job-finish",
 };
+
+test "process job catalogue omits systemd-only controls and fields" {
+    var policy = test_policy;
+    policy.job_backend = .process;
+    try std.testing.expect(std.mem.indexOf(u8, inputSchemaJsonForPolicy(policy, .job_start), "systemd") == null);
+    try std.testing.expect(std.mem.indexOf(u8, outputSchemaJsonForPolicy(policy, .job_start), "unit") == null);
+    try std.testing.expect(std.mem.indexOf(u8, outputSchemaJsonForPolicy(policy, .job_read), "systemd") == null);
+    try std.testing.expect(std.mem.indexOf(u8, descriptionForPolicy(policy, .job_cancel), "systemd") == null);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var args = object();
+    var argv: std.json.Array = .init(allocator);
+    try argv.append(.{ .string = "/usr/bin/true" });
+    try put(allocator, &args, "argv", .{ .array = argv });
+    try put(allocator, &args, "cwd", .{ .string = "/tmp" });
+    var properties: std.json.Array = .init(allocator);
+    try properties.append(.{ .string = "MemoryMax=1G" });
+    try put(allocator, &args, "systemd_properties", .{ .array = properties });
+    try std.testing.expectError(error.InvalidArguments, validateArgumentsForPolicy(policy, .job_start, args));
+}
 
 test "job start validates native systemd resource properties before dispatch" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

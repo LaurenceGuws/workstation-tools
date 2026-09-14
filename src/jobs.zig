@@ -1,7 +1,7 @@
-//! Owns durable background jobs backed by transient systemd user services.
+//! Owns durable background jobs behind one explicit host-selected backend.
 //!
-//! systemd owns cgroup lifetime, runtime deadlines, and cancellation. The package owns bounded stdin/stdout/stderr files and
-//! a tiny durable terminal receipt so completed jobs remain observable after transient units are garbage-collected.
+//! The systemd backend delegates lifetime and cgroup control to transient user services. The process backend owns a small
+//! detached supervisor. Both retain bounded streams and durable receipts so observation is independent of the initiating call.
 
 const std = @import("std");
 const environment = @import("environment.zig");
@@ -54,6 +54,7 @@ pub const Error = state.Error || process.Error || environment.Error || error{
     JobLaunchFailed,
     JobControlFailed,
     OffsetOutOfRange,
+    ProcessIdentityUnavailable,
 };
 
 /// Arguments admitted when creating one durable job.
@@ -82,7 +83,7 @@ pub const JobState = enum {
 pub const Meta = struct {
     job_id: []const u8,
     state: JobState,
-    unit: []const u8,
+    unit: ?[]const u8 = null,
     argv: []const []const u8,
     cwd: []const u8,
     created_at: i64,
@@ -130,8 +131,9 @@ pub const CancelResult = struct {
 };
 
 const Request = struct {
+    backend: host_policy.JobBackend = .systemd_user,
     job_id: []const u8,
-    unit: []const u8,
+    unit: ?[]const u8 = null,
     argv: []const []const u8,
     cwd: []const u8,
     has_stdin: bool,
@@ -143,10 +145,17 @@ const Request = struct {
 
 const Terminal = struct {
     state: TerminalState,
-    service_result: []const u8,
+    service_result: []const u8 = "",
     exit_kind: []const u8,
     exit_status: []const u8,
     ended_at: i64,
+};
+
+const ProcessRuntime = struct {
+    supervisor_pid: i32,
+    supervisor_start_time: u64,
+    child_pid: ?i32 = null,
+    child_start_time: ?u64 = null,
 };
 
 const TerminalState = enum {
@@ -177,7 +186,7 @@ const StreamSlice = struct {
     size: usize,
 };
 
-/// Creates one private job directory and submits a transient systemd user service.
+/// Creates one private job directory and submits it to the selected durable-job backend.
 pub fn start(
     init: std.process.Init,
     allocator: Allocator,
@@ -187,7 +196,7 @@ pub fn start(
     request: StartRequest,
 ) Error!Meta {
     try policy.validate();
-    try validateStart(init.io, request);
+    try validateStart(init.io, policy, request);
     var id: [32]u8 = undefined;
     state.randomHex(init.io, &id);
     const job_id = allocator.dupe(u8, &id) catch return error.OutOfMemory;
@@ -199,8 +208,12 @@ pub fn start(
     var launched = false;
     errdefer if (!launched) Io.Dir.cwd().deleteTree(init.io, job_dir) catch {};
 
-    const unit = try std.fmt.allocPrint(allocator, "{s}{s}.service", .{ policy.job_unit_prefix, id });
+    const unit: ?[]const u8 = switch (policy.job_backend) {
+        .systemd_user => try std.fmt.allocPrint(allocator, "{s}{s}.service", .{ policy.job_unit_prefix, id }),
+        .process => null,
+    };
     const stored = Request{
+        .backend = policy.job_backend,
         .job_id = job_id,
         .unit = unit,
         .argv = request.argv,
@@ -222,9 +235,25 @@ pub fn start(
     try createEmpty(init.io, job_dir, "stdout");
     try createEmpty(init.io, job_dir, "stderr");
 
-    const runtime = try std.fmt.allocPrint(allocator, "RuntimeMaxSec={d}s", .{request.timeout_seconds});
+    switch (policy.job_backend) {
+        .systemd_user => try launchSystemd(init, allocator, policy, executable, job_dir, stored),
+        .process => try launchProcess(init, policy, executable, job_dir),
+    }
+    launched = true;
+    return startingMeta(stored);
+}
+
+fn launchSystemd(
+    init: std.process.Init,
+    allocator: Allocator,
+    policy: host_policy.Policy,
+    executable: []const u8,
+    job_dir: []const u8,
+    stored: Request,
+) Error!void {
+    const runtime = try std.fmt.allocPrint(allocator, "RuntimeMaxSec={d}s", .{stored.timeout_seconds});
     const stop_post = try execStopPost(allocator, policy.job_finish_argument, executable, job_dir);
-    const unit_arg = try std.fmt.allocPrint(allocator, "--unit={s}", .{unit});
+    const unit_arg = try std.fmt.allocPrint(allocator, "--unit={s}", .{stored.unit.?});
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
     argv.appendSlice(allocator, &.{
@@ -239,16 +268,34 @@ pub fn start(
         try std.fmt.allocPrint(allocator, "--property={s}", .{runtime}),
         try std.fmt.allocPrint(allocator, "--property={s}", .{stop_post}),
     }) catch return error.OutOfMemory;
-    for (request.systemd_properties) |property| {
+    for (stored.systemd_properties) |property| {
         argv.append(allocator, "--property") catch return error.OutOfMemory;
         argv.append(allocator, property) catch return error.OutOfMemory;
     }
     argv.appendSlice(allocator, &.{ "--", executable, policy.job_run_argument, job_dir }) catch return error.OutOfMemory;
-    var launch = try process.run(init.gpa, init.io, argv.items, "/", null, .fromSeconds(10), null);
-    defer launch.deinit(init.gpa);
-    if (launch.timed_out or launch.term == null or exitCode(launch.term.?) != 0) return error.JobLaunchFailed;
-    launched = true;
-    return startingMeta(stored);
+    var result = try process.run(init.gpa, init.io, argv.items, "/", null, .fromSeconds(10), null);
+    defer result.deinit(init.gpa);
+    if (result.timed_out or result.term == null or exitCode(result.term.?) != 0) return error.JobLaunchFailed;
+}
+
+fn launchProcess(
+    init: std.process.Init,
+    policy: host_policy.Policy,
+    executable: []const u8,
+    job_dir: []const u8,
+) Error!void {
+    const launch_argument = policy.job_launch_argument orelse return error.InvalidPolicy;
+    var result = try process.run(
+        init.gpa,
+        init.io,
+        &.{ executable, launch_argument, job_dir },
+        "/",
+        null,
+        .fromSeconds(10),
+        init.environ_map,
+    );
+    defer result.deinit(init.gpa);
+    if (result.timed_out or result.term == null or exitCode(result.term.?) != 0) return error.JobLaunchFailed;
 }
 
 /// Reads one job receipt and bounded positional stream slices without retaining a job registry.
@@ -294,7 +341,7 @@ pub fn read(
     };
 }
 
-/// Cancels one running transient service through systemd and returns its resulting durable state.
+/// Cancels one running durable job through its selected backend.
 pub fn cancel(
     io: Io,
     allocator: Allocator,
@@ -315,16 +362,58 @@ pub fn cancel(
         .reason = .already_finished,
     };
 
-    try requestStop(io, allocator, job_dir, &.{ systemctl, "--user", "stop", stored.unit });
+    switch (stored.backend) {
+        .systemd_user => try requestStop(io, allocator, job_dir, &.{ systemctl, "--user", "stop", stored.unit.? }),
+        .process => try requestProcessStop(io, allocator, job_dir),
+    }
     const current = try observe(io, allocator, job_dir, stored);
     return .{ .meta = current.meta, .cancelled = true, .reason = .stop_requested };
 }
 
-/// Runs one durable job payload inside the transient unit while retaining bounded separate streams.
+/// Starts one detached process-backend supervisor from the short-lived launcher role.
+pub fn launch(init: std.process.Init, policy: host_policy.Policy, job_dir: []const u8) Error!void {
+    try policy.validate();
+    if (policy.job_backend != .process) return error.InvalidPolicy;
+    const allocator = init.arena.allocator();
+    const stored = try readRequest(init.io, allocator, policy, job_dir, std.fs.path.basename(job_dir));
+    try validateExecution(init.io, stored);
+    const executable = std.process.executablePathAlloc(init.io, allocator) catch return error.JobLaunchFailed;
+    var supervisor = std.process.spawn(init.io, .{
+        .argv = &.{ executable, policy.job_run_argument, job_dir },
+        .cwd = .{ .path = "/" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .pgid = 0,
+        .environ_map = init.environ_map,
+    }) catch return error.JobLaunchFailed;
+    const pid: i32 = @intCast(supervisor.id orelse return error.JobLaunchFailed);
+    var published = false;
+    defer if (!published) {
+        signalProcessGroup(pid, .KILL) catch {};
+        _ = supervisor.wait(init.io) catch null;
+    };
+    const start_time = try processStartTime(init.io, pid);
+    try writeProcessRuntime(init.io, job_dir, .{
+        .supervisor_pid = pid,
+        .supervisor_start_time = start_time,
+    });
+    published = true;
+}
+
+/// Runs one durable job payload under the helper role selected by the backend.
 pub fn run(init: std.process.Init, policy: host_policy.Policy, job_dir: []const u8) Error!void {
     try policy.validate();
     const allocator = init.arena.allocator();
     const stored = try readRequest(init.io, allocator, policy, job_dir, std.fs.path.basename(job_dir));
+    return switch (stored.backend) {
+        .systemd_user => runSystemd(init, policy, job_dir, stored),
+        .process => runProcessSupervisor(init, policy, job_dir, stored),
+    };
+}
+
+fn runSystemd(init: std.process.Init, policy: host_policy.Policy, job_dir: []const u8, stored: Request) Error!void {
+    const allocator = init.arena.allocator();
     try validateExecution(init.io, stored);
     var stdout_path_buffer: [state.max_path_bytes]u8 = undefined;
     var stderr_path_buffer: [state.max_path_bytes]u8 = undefined;
@@ -417,6 +506,153 @@ pub fn run(init: std.process.Init, policy: host_policy.Policy, job_dir: []const 
     std.process.exit(serviceExitCode(term));
 }
 
+fn runProcessSupervisor(
+    init: std.process.Init,
+    policy: host_policy.Policy,
+    job_dir: []const u8,
+    stored: Request,
+) Error!void {
+    const allocator = init.arena.allocator();
+    try validateExecution(init.io, stored);
+    const supervisor = try awaitProcessRuntime(init.io, allocator, job_dir);
+    const self_pid: i32 = @intCast(std.os.linux.getpid());
+    if (supervisor.supervisor_pid != self_pid or
+        !try processIdentityAlive(init.io, self_pid, supervisor.supervisor_start_time)) return error.InvalidJob;
+
+    var stdout_path_buffer: [state.max_path_bytes]u8 = undefined;
+    var stderr_path_buffer: [state.max_path_bytes]u8 = undefined;
+    const stdout_path = try jobPath(&stdout_path_buffer, job_dir, "stdout");
+    const stderr_path = try jobPath(&stderr_path_buffer, job_dir, "stderr");
+    const stdout_file = Io.Dir.cwd().createFile(init.io, stdout_path, .{ .truncate = true, .permissions = .fromMode(0o600) }) catch
+        return error.JobOutputFailed;
+    defer stdout_file.close(init.io);
+    const stderr_file = Io.Dir.cwd().createFile(init.io, stderr_path, .{ .truncate = true, .permissions = .fromMode(0o600) }) catch
+        return error.JobOutputFailed;
+    defer stderr_file.close(init.io);
+
+    var stdin_bytes: ?[]const u8 = null;
+    if (stored.has_stdin) {
+        var stdin_path_buffer: [state.max_path_bytes]u8 = undefined;
+        const stdin_path = try jobPath(&stdin_path_buffer, job_dir, "stdin");
+        stdin_bytes = Io.Dir.cwd().readFileAlloc(
+            init.io,
+            stdin_path,
+            allocator,
+            .limited(process.max_stdin_bytes),
+        ) catch return error.InvalidJob;
+    }
+    var child_env = try environment.current(
+        init,
+        init.gpa,
+        policy.environment_source,
+        policy.operator_marker,
+    );
+    defer child_env.deinit();
+    if (policy.agent_marker) |marker| try child_env.put(marker.name, marker.value);
+    var child_argv = stored.argv;
+    var argv_storage: ?[][]const u8 = null;
+    defer if (argv_storage) |items| init.gpa.free(items);
+    if (std.mem.indexOfScalar(u8, stored.argv[0], '/') == null) {
+        const resolved = try environment.resolveExecutable(init.io, allocator, &child_env, stored.cwd, stored.argv[0]);
+        const items = init.gpa.alloc([]const u8, stored.argv.len) catch return error.OutOfMemory;
+        @memcpy(items, stored.argv);
+        items[0] = resolved;
+        argv_storage = items;
+        child_argv = items;
+    }
+    var child = std.process.spawn(init.io, .{
+        .argv = child_argv,
+        .cwd = .{ .path = stored.cwd },
+        .stdin = if (stdin_bytes == null) .ignore else .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .pgid = 0,
+        .environ_map = &child_env,
+    }) catch return error.SpawnFailed;
+    defer if (child.id != null) child.kill(init.io);
+    const child_pid: i32 = @intCast(child.id orelse return error.SpawnFailed);
+    const child_start_time = try processStartTime(init.io, child_pid);
+    try writeProcessRuntime(init.io, job_dir, .{
+        .supervisor_pid = self_pid,
+        .supervisor_start_time = supervisor.supervisor_start_time,
+        .child_pid = child_pid,
+        .child_start_time = child_start_time,
+    });
+    std.debug.assert(child.stdout != null);
+    std.debug.assert(child.stderr != null);
+    if (exists(init.io, job_dir, "cancelled")) try signalProcessGroup(child_pid, .TERM);
+
+    var input_task = if (stdin_bytes) |bytes| task: {
+        std.debug.assert(child.stdin != null);
+        const input = child.stdin.?;
+        child.stdin = null;
+        break :task init.io.concurrent(writeInput, .{ init.io, input, bytes }) catch return error.StdinWriteFailed;
+    } else null;
+    defer if (input_task) |*task| task.cancel(init.io) catch {};
+
+    var stream_storage: Io.File.MultiReader.Buffer(2) = undefined;
+    var streams: Io.File.MultiReader = undefined;
+    streams.init(init.gpa, init.io, stream_storage.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer streams.deinit();
+    const stdout_reader = streams.reader(0);
+    const stderr_reader = streams.reader(1);
+    const run_deadline = Io.Clock.Timestamp.fromNow(init.io, .{
+        .raw = .fromSeconds(stored.timeout_seconds),
+        .clock = .awake,
+    });
+    var stop_deadline: ?Io.Clock.Timestamp = null;
+    var timed_out = false;
+    var killed = false;
+    var gave_up_streams = false;
+    var stdout_written: usize = 0;
+    var stderr_written: usize = 0;
+    while (true) {
+        const timeout: Io.Timeout = if (!timed_out)
+            .{ .deadline = run_deadline }
+        else if (!killed)
+            .{ .deadline = stop_deadline.? }
+        else
+            .{ .deadline = stop_deadline.? };
+        streams.fill(64 * 1024, timeout) catch |failure| switch (failure) {
+            error.EndOfStream => break,
+            error.Timeout => {
+                if (!timed_out) {
+                    timed_out = true;
+                    signalProcessGroup(child_pid, .TERM) catch |signal_failure| switch (signal_failure) {
+                        error.ProcessNotFound => {},
+                        else => return error.JobControlFailed,
+                    };
+                    stop_deadline = Io.Clock.Timestamp.fromNow(init.io, .{ .raw = .fromSeconds(5), .clock = .awake });
+                } else if (!killed) {
+                    killed = true;
+                    signalProcessGroup(child_pid, .KILL) catch |signal_failure| switch (signal_failure) {
+                        error.ProcessNotFound => {},
+                        else => return error.JobControlFailed,
+                    };
+                    stop_deadline = Io.Clock.Timestamp.fromNow(init.io, .{ .raw = .fromSeconds(1), .clock = .awake });
+                } else {
+                    gave_up_streams = true;
+                    break;
+                }
+                continue;
+            },
+            else => return error.JobOutputFailed,
+        };
+        try drain(init.io, job_dir, "stdout", stdout_reader, stdout_file, stored.output_limit_bytes, &stdout_written);
+        try drain(init.io, job_dir, "stderr", stderr_reader, stderr_file, stored.output_limit_bytes, &stderr_written);
+    }
+    try drain(init.io, job_dir, "stdout", stdout_reader, stdout_file, stored.output_limit_bytes, &stdout_written);
+    try drain(init.io, job_dir, "stderr", stderr_reader, stderr_file, stored.output_limit_bytes, &stderr_written);
+    if (!gave_up_streams) streams.checkAnyError() catch return error.JobOutputFailed;
+    stdout_file.sync(init.io) catch return error.JobOutputFailed;
+    stderr_file.sync(init.io) catch return error.JobOutputFailed;
+    const term = child.wait(init.io) catch return error.WaitFailed;
+    if (input_task) |*task| task.await(init.io) catch {
+        if (!timed_out and !exists(init.io, job_dir, "cancelled")) return error.StdinWriteFailed;
+    };
+    try writeProcessTerminal(init.io, allocator, job_dir, term, timed_out);
+}
+
 fn writeInput(io: Io, file: Io.File, bytes: []const u8) Io.File.Writer.Error!void {
     defer file.close(io);
     try file.writeStreamingAll(io, bytes);
@@ -426,6 +662,7 @@ fn writeInput(io: Io, file: Io.File, bytes: []const u8) Io.File.Writer.Error!voi
 pub fn finish(init: std.process.Init, policy: host_policy.Policy, job_dir: []const u8) Error!void {
     try policy.validate();
     const stored = try readRequest(init.io, init.arena.allocator(), policy, job_dir, std.fs.path.basename(job_dir));
+    if (stored.backend != .systemd_user) return error.InvalidJob;
     std.debug.assert(std.mem.eql(u8, stored.job_id, std.fs.path.basename(job_dir)));
     const service_result = init.environ_map.get("SERVICE_RESULT") orelse return error.InvalidJob;
     const exit_kind = init.environ_map.get("EXIT_CODE") orelse "";
@@ -444,7 +681,7 @@ pub fn finish(init: std.process.Init, policy: host_policy.Policy, job_dir: []con
     });
 }
 
-fn validateStart(io: Io, request: StartRequest) Error!void {
+fn validateStart(io: Io, policy: host_policy.Policy, request: StartRequest) Error!void {
     try validateArgv(request.argv);
     if (request.cwd.len == 0 or request.cwd.len > state.max_path_bytes) return error.InvalidJob;
     if (request.stdin) |bytes| if (bytes.len > process.max_stdin_bytes) return error.InvalidJob;
@@ -452,26 +689,38 @@ fn validateStart(io: Io, request: StartRequest) Error!void {
     if (request.output_limit_bytes < min_output_limit_bytes or request.output_limit_bytes > max_output_limit_bytes) {
         return error.InvalidJob;
     }
-    try validateSystemdProperties(request.systemd_properties);
+    if (policy.job_backend == .systemd_user) {
+        try validateSystemdProperties(request.systemd_properties);
+    } else if (request.systemd_properties.len != 0) {
+        return error.InvalidJob;
+    }
     var directory = Io.Dir.cwd().openDir(io, request.cwd, .{}) catch return error.InvalidJob;
     directory.close(io);
 }
 
 fn validateStored(policy: host_policy.Policy, request: Request, expected_job_id: []const u8) Error!void {
     // Domain invariant: durable metadata is redundant evidence, never authority for process control. The caller-selected
-    // directory, stored job ID, and exact derived systemd unit must agree before any observation or signal is admitted.
+    // directory and stored job ID must agree before any observation or signal is admitted; each backend adds its own identity.
     if (!validId(expected_job_id) or !std.mem.eql(u8, request.job_id, expected_job_id)) return error.InvalidJob;
-    var unit_buffer: [host_policy.max_job_unit_prefix_bytes + 32 + ".service".len]u8 = undefined;
-    const expected_unit = std.fmt.bufPrint(&unit_buffer, "{s}{s}.service", .{ policy.job_unit_prefix, expected_job_id }) catch
-        return error.InvalidJob;
-    if (!std.mem.eql(u8, request.unit, expected_unit)) return error.InvalidJob;
+    switch (request.backend) {
+        .systemd_user => {
+            const unit = request.unit orelse return error.InvalidJob;
+            var unit_buffer: [host_policy.max_job_unit_prefix_bytes + 32 + ".service".len]u8 = undefined;
+            const expected = std.fmt.bufPrint(&unit_buffer, "{s}{s}.service", .{ policy.job_unit_prefix, expected_job_id }) catch
+                return error.InvalidJob;
+            if (!std.mem.eql(u8, unit, expected)) return error.InvalidJob;
+            try validateSystemdProperties(request.systemd_properties);
+        },
+        .process => {
+            if (request.unit != null or request.systemd_properties.len != 0) return error.InvalidJob;
+        },
+    }
     try validateArgv(request.argv);
     if (request.cwd.len == 0 or request.cwd.len > state.max_path_bytes) return error.InvalidJob;
     if (request.timeout_seconds == 0 or request.timeout_seconds > max_timeout_seconds) return error.InvalidJob;
     if (request.output_limit_bytes < min_output_limit_bytes or request.output_limit_bytes > max_output_limit_bytes) {
         return error.InvalidJob;
     }
-    try validateSystemdProperties(request.systemd_properties);
 }
 
 fn validateExecution(io: Io, request: Request) Error!void {
@@ -519,9 +768,29 @@ const test_policy = host_policy.Policy{
     .operator_marker = .{ .name = "OPERATOR_PROFILE", .value = "1" },
     .shell_prelude = "unset OPERATOR_PROFILE;HISTFILE=/dev/null;set +o history;",
     .job_unit_prefix = "workstation-job-",
+    .job_launch_argument = "--job-launch",
     .job_run_argument = "--job-run",
     .job_finish_argument = "--job-finish",
 };
+
+test "process backend rejects systemd-only resource properties" {
+    var policy = test_policy;
+    policy.job_backend = .process;
+    try std.testing.expectError(error.InvalidJob, validateStart(std.testing.io, policy, .{
+        .argv = &.{"true"},
+        .cwd = "/tmp",
+        .timeout_seconds = 1,
+        .output_limit_bytes = min_output_limit_bytes,
+        .systemd_properties = &.{"MemoryMax=1G"},
+    }));
+}
+
+test "linux process identity binds pid to proc start time" {
+    const pid: i32 = @intCast(std.os.linux.getpid());
+    const start_time = try processStartTime(std.testing.io, pid);
+    try std.testing.expect(try processIdentityAlive(std.testing.io, pid, start_time));
+    try std.testing.expect(!try processIdentityAlive(std.testing.io, pid, start_time + 1));
+}
 
 test "durable jobs admit only unique resource-control systemd properties" {
     try validateSystemdProperties(&.{
@@ -553,7 +822,7 @@ test "legacy durable job metadata defaults to no systemd resource properties" {
 
 test "durable job stdin admission matches the shared process bound" {
     var accepted: [process.max_stdin_bytes]u8 = @splat('x');
-    try validateStart(std.testing.io, .{
+    try validateStart(std.testing.io, test_policy, .{
         .argv = &.{"true"},
         .cwd = "/tmp",
         .stdin = &accepted,
@@ -562,7 +831,7 @@ test "durable job stdin admission matches the shared process bound" {
     });
 
     var rejected: [process.max_stdin_bytes + 1]u8 = @splat('x');
-    try std.testing.expectError(error.InvalidJob, validateStart(std.testing.io, .{
+    try std.testing.expectError(error.InvalidJob, validateStart(std.testing.io, test_policy, .{
         .argv = &.{"true"},
         .cwd = "/tmp",
         .stdin = &rejected,
@@ -575,8 +844,10 @@ fn observe(io: Io, allocator: Allocator, job_dir: []const u8, request: Request) 
     const result = try optionalJson(Terminal, io, allocator, job_dir, "result.json");
     const current_state = if (result) |terminal_result|
         terminal_result.state.jobState()
-    else
-        try liveState(io, allocator, request.unit);
+    else switch (request.backend) {
+        .systemd_user => try liveSystemdState(io, allocator, request.unit.?),
+        .process => try liveProcessState(io, allocator, job_dir),
+    };
     return .{ .meta = .{
         .job_id = request.job_id,
         .state = current_state,
@@ -610,7 +881,7 @@ fn startingMeta(request: Request) Meta {
     };
 }
 
-fn liveState(io: Io, allocator: Allocator, unit: []const u8) Error!JobState {
+fn liveSystemdState(io: Io, allocator: Allocator, unit: []const u8) Error!JobState {
     var observation = try process.run(
         allocator,
         io,
@@ -634,6 +905,18 @@ fn liveState(io: Io, allocator: Allocator, unit: []const u8) Error!JobState {
     if (std.mem.eql(u8, active, "active")) return .running;
     if (std.mem.eql(u8, active, "deactivating")) return .stopping;
     return .indeterminate;
+}
+
+fn liveProcessState(io: Io, allocator: Allocator, job_dir: []const u8) Error!JobState {
+    const runtime = (try optionalJson(ProcessRuntime, io, allocator, job_dir, "runtime.json")) orelse
+        return .indeterminate;
+    if (!try processIdentityAlive(io, runtime.supervisor_pid, runtime.supervisor_start_time)) return .indeterminate;
+    const child_pid = runtime.child_pid orelse return .starting;
+    const child_start_time = runtime.child_start_time orelse return .indeterminate;
+    if (try processIdentityAlive(io, child_pid, child_start_time)) {
+        return if (exists(io, job_dir, "cancelled")) .stopping else .running;
+    }
+    return .stopping;
 }
 
 fn readRequest(
@@ -672,6 +955,135 @@ fn terminalExitCode(result: ?Terminal) ?i32 {
     const terminal_result = result orelse return null;
     if (!std.mem.eql(u8, terminal_result.exit_kind, "exited")) return null;
     return std.fmt.parseInt(i32, terminal_result.exit_status, 10) catch null;
+}
+
+fn writeProcessRuntime(io: Io, job_dir: []const u8, runtime: ProcessRuntime) Error!void {
+    var path_buffer: [state.max_path_bytes]u8 = undefined;
+    const path = try jobPath(&path_buffer, job_dir, "runtime.json");
+    try state.writeJsonAtomic(io, path, runtime);
+}
+
+fn awaitProcessRuntime(io: Io, allocator: Allocator, job_dir: []const u8) Error!ProcessRuntime {
+    for (0..100) |_| {
+        if (try optionalJson(ProcessRuntime, io, allocator, job_dir, "runtime.json")) |runtime| return runtime;
+        Io.sleep(io, .fromMilliseconds(10), .awake) catch return error.ProcessIdentityUnavailable;
+    }
+    return error.ProcessIdentityUnavailable;
+}
+
+fn processStartTime(io: Io, pid: i32) Error!u64 {
+    const identity = (try readProcessIdentity(io, pid)) orelse return error.ProcessIdentityUnavailable;
+    return identity.start_time;
+}
+
+fn processIdentityAlive(io: Io, pid: i32, start_time: u64) Error!bool {
+    const identity = (try readProcessIdentity(io, pid)) orelse return false;
+    return identity.state != 'Z' and identity.start_time == start_time;
+}
+
+const ProcessIdentity = struct {
+    state: u8,
+    start_time: u64,
+};
+
+fn readProcessIdentity(io: Io, pid: i32) Error!?ProcessIdentity {
+    if (pid <= 1) return error.InvalidJob;
+    var path_buffer: [64]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buffer, "/proc/{d}/stat", .{pid}) catch return error.InvalidJob;
+    if (Io.Dir.cwd().statFile(io, path, .{})) |_| {} else |failure| switch (failure) {
+        error.FileNotFound => return null,
+        else => return error.ProcessIdentityUnavailable,
+    }
+    var bytes_buffer: [16 * 1024]u8 = undefined;
+    const bytes = Io.Dir.cwd().readFile(io, path, &bytes_buffer) catch return error.ProcessIdentityUnavailable;
+    const close = std.mem.lastIndexOfScalar(u8, bytes, ')') orelse return error.ProcessIdentityUnavailable;
+    if (close + 2 >= bytes.len or bytes[close + 1] != ' ') return error.ProcessIdentityUnavailable;
+    var fields = std.mem.splitScalar(u8, bytes[close + 2 ..], ' ');
+    var index: usize = 0;
+    var process_state: ?u8 = null;
+    while (fields.next()) |field| : (index += 1) {
+        if (field.len == 0) continue;
+        if (process_state == null) {
+            if (field.len != 1) return error.ProcessIdentityUnavailable;
+            process_state = field[0];
+        }
+        if (index == 19) {
+            return .{
+                .state = process_state orelse return error.ProcessIdentityUnavailable,
+                .start_time = std.fmt.parseInt(u64, field, 10) catch return error.ProcessIdentityUnavailable,
+            };
+        }
+    }
+    return error.ProcessIdentityUnavailable;
+}
+
+fn signalProcessGroup(pid: i32, signal: std.posix.SIG) std.posix.KillError!void {
+    return std.posix.kill(-@as(std.posix.pid_t, @intCast(pid)), signal);
+}
+
+fn requestProcessStop(io: Io, allocator: Allocator, job_dir: []const u8) Error!void {
+    var marker_path_buffer: [state.max_path_bytes]u8 = undefined;
+    const marker = try jobPath(&marker_path_buffer, job_dir, "cancelled");
+    try state.writeBytesAtomic(io, marker, "", .fromMode(0o600));
+    errdefer Io.Dir.cwd().deleteFile(io, marker) catch {};
+    const runtime = (try optionalJson(ProcessRuntime, io, allocator, job_dir, "runtime.json")) orelse
+        return error.JobControlFailed;
+    if (!try processIdentityAlive(io, runtime.supervisor_pid, runtime.supervisor_start_time)) {
+        return error.JobControlFailed;
+    }
+    const child_pid = runtime.child_pid orelse return;
+    const child_start_time = runtime.child_start_time orelse return error.JobControlFailed;
+    if (!try processIdentityAlive(io, child_pid, child_start_time)) return;
+    signalProcessGroup(child_pid, .TERM) catch |failure| switch (failure) {
+        error.ProcessNotFound => return,
+        else => return error.JobControlFailed,
+    };
+    for (0..50) |_| {
+        if (!try processIdentityAlive(io, child_pid, child_start_time)) return;
+        Io.sleep(io, .fromMilliseconds(100), .awake) catch return error.JobControlFailed;
+    }
+    signalProcessGroup(child_pid, .KILL) catch |failure| switch (failure) {
+        error.ProcessNotFound => return,
+        else => return error.JobControlFailed,
+    };
+}
+
+fn writeProcessTerminal(
+    io: Io,
+    allocator: Allocator,
+    job_dir: []const u8,
+    term: std.process.Child.Term,
+    timed_out: bool,
+) Error!void {
+    const cancelled = exists(io, job_dir, "cancelled");
+    const terminal_state: TerminalState = if (timed_out)
+        .timed_out
+    else if (cancelled)
+        .cancelled
+    else switch (term) {
+        .exited => .exited,
+        .signal, .stopped, .unknown => .failed,
+    };
+    const exit_kind = switch (term) {
+        .exited => "exited",
+        .signal => "signal",
+        .stopped => "stopped",
+        .unknown => "unknown",
+    };
+    const exit_status = switch (term) {
+        .exited => |value| try std.fmt.allocPrint(allocator, "{d}", .{value}),
+        .signal => |value| try std.fmt.allocPrint(allocator, "{d}", .{@backingInt(value)}),
+        .stopped => |value| try std.fmt.allocPrint(allocator, "{d}", .{@backingInt(value)}),
+        .unknown => |value| try std.fmt.allocPrint(allocator, "{d}", .{value}),
+    };
+    var result_path_buffer: [state.max_path_bytes]u8 = undefined;
+    const result_path = try jobPath(&result_path_buffer, job_dir, "result.json");
+    try state.writeJsonAtomic(io, result_path, Terminal{
+        .state = terminal_state,
+        .exit_kind = exit_kind,
+        .exit_status = exit_status,
+        .ended_at = state.timestamp(io),
+    });
 }
 
 fn execStopPost(allocator: Allocator, finish_argument: []const u8, executable: []const u8, job_dir: []const u8) Error![]const u8 {

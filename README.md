@@ -9,3 +9,9 @@ Embedding hosts explicitly select where child-process environment comes from thr
 long-lived desktop agents. An isolated host such as a container may instead select `process`, which snapshots the embedding
 process environment and still runs the same bounded login-shell environment normalization. The package never guesses between
 those environments from filesystem or process-manager availability.
+
+Durable jobs likewise use an explicit `Policy.job_backend`. `systemd_user` preserves the existing transient-user-service
+backend, including cgroup lifetime, native resource controls and restart-independent observation. `process` uses a detached
+package-owned supervisor with durable PID/start-time identity, bounded stream files, timeout/cancel handling and terminal
+receipts. The process backend deliberately does not advertise or accept systemd resource properties. Backend selection is a
+host decision; workstation-tools never guesses from whether systemd happens to be reachable.

@@ -10,14 +10,17 @@ pub const max_job_unit_prefix_bytes: usize = 32;
 /// Maximum executable role argument bytes used by durable job helpers.
 pub const max_job_role_argument_bytes: usize = 64;
 pub const EnvironmentSource = environment.Source;
+pub const JobBackend = enum { systemd_user, process };
 
 /// Host-selected execution policy. Empty optional markers mean no environment marker is injected.
 pub const Policy = struct {
     environment_source: EnvironmentSource = .user_manager,
+    job_backend: JobBackend = .systemd_user,
     agent_marker: ?environment.Marker = null,
     operator_marker: ?environment.Marker = null,
     shell_prelude: []const u8 = "declare -xr HISTFILE=/dev/null;set +o history;",
     job_unit_prefix: []const u8,
+    job_launch_argument: ?[]const u8 = null,
     job_run_argument: []const u8,
     job_finish_argument: []const u8,
 
@@ -25,6 +28,11 @@ pub const Policy = struct {
     pub fn validate(self: Policy) error{InvalidPolicy}!void {
         if (self.shell_prelude.len > max_shell_prelude_bytes) return error.InvalidPolicy;
         if (!validUnitPrefix(self.job_unit_prefix)) return error.InvalidPolicy;
+        if (self.job_backend == .process) {
+            if (!validRoleArgument(self.job_launch_argument orelse return error.InvalidPolicy)) return error.InvalidPolicy;
+        } else if (self.job_launch_argument) |argument| {
+            if (!validRoleArgument(argument)) return error.InvalidPolicy;
+        }
         if (!validRoleArgument(self.job_run_argument) or !validRoleArgument(self.job_finish_argument)) {
             return error.InvalidPolicy;
         }
@@ -58,6 +66,7 @@ test "host policy rejects unsafe markers and job identity bytes" {
         .agent_marker = .{ .name = "AGENT_CHILD", .value = "1" },
         .operator_marker = .{ .name = "OPERATOR_PROFILE", .value = "1" },
         .job_unit_prefix = "agent-job-",
+        .job_launch_argument = "--job-launch",
         .job_run_argument = "--job-run",
         .job_finish_argument = "--job-finish",
     };
@@ -67,5 +76,9 @@ test "host policy rejects unsafe markers and job identity bytes" {
     try std.testing.expectError(error.InvalidPolicy, invalid.validate());
     invalid = valid;
     invalid.agent_marker = .{ .name = "BAD=NAME", .value = "1" };
+    try std.testing.expectError(error.InvalidPolicy, invalid.validate());
+    invalid = valid;
+    invalid.job_backend = .process;
+    invalid.job_launch_argument = null;
     try std.testing.expectError(error.InvalidPolicy, invalid.validate());
 }
