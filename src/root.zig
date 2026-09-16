@@ -60,6 +60,8 @@ pub const Policy = host_policy.Policy;
 pub const EnvironmentSource = host_policy.EnvironmentSource;
 pub const JobBackend = host_policy.JobBackend;
 pub const WalkerConfig = host_policy.WalkerConfig;
+/// Typed CLI observation for operator clients; this does not add model-facing tools.
+pub const Walker = @import("walker.zig");
 /// Optional environment marker supplied by host policy.
 pub const Marker = environment.Marker;
 
@@ -636,7 +638,7 @@ fn put(allocator: Allocator, output: *std.json.ObjectMap, key: []const u8, value
 }
 
 /// Tool streams are text. Invalid or split UTF-8 becomes U+FFFD; retained bytes and offsets stay unchanged.
-fn outputText(allocator: Allocator, bytes: []const u8) Error![]u8 {
+pub fn outputText(allocator: Allocator, bytes: []const u8) Error![]u8 {
     if (std.unicode.utf8ValidateSlice(bytes)) return dupe(allocator, bytes);
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(allocator);

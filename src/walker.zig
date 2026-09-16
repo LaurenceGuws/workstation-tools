@@ -228,3 +228,218 @@ test "configuration requires exact absolute executable and state directory" {
     try std.testing.expect(!validConfig(.{ .executable = "/bin/walker", .home = "state" }));
     try std.testing.expect(validConfig(.{ .executable = "/bin/walker", .home = "/state" }));
 }
+
+/// Host inventory is independent of agent admission history. All returned slices
+/// belong to the caller allocator, normally a request arena.
+pub const max_workloads = 512;
+pub const Retention = enum { prefix, recent };
+pub const WorkloadSummary = struct {
+    name: []const u8,
+    run_id: []const u8,
+    state: State,
+    pid: ?i32,
+    command: []const u8,
+    cwd: []const u8,
+    created_at_ms: i64,
+    log_retention: Retention,
+};
+pub const Workload = struct {
+    schema: []const u8,
+    name: []const u8,
+    run_id: []const u8,
+    state: State,
+    pid: ?i32,
+    walker_pid: i32,
+    argv: []const []const u8,
+    cwd: []const u8,
+    created_at_ms: i64,
+    started_at_ms: ?i64,
+    ended_at_ms: ?i64,
+    timeout_ms: ?u32,
+    log_retention: Retention,
+    output_limit_bytes: u32,
+    exit_code: ?u8,
+    signal: ?u8,
+    failure: ?[]const u8,
+    streams_complete: bool,
+};
+pub const WindowSlice = struct {
+    encoding: []const u8,
+    data: []const u8,
+    requested_offset: ?u64,
+    oldest_offset: u64,
+    end_offset: u64,
+    start_offset: u64,
+    next_offset: u64,
+    gap_bytes: u64,
+    eof: bool,
+};
+pub const WorkloadLogs = struct {
+    schema: []const u8,
+    ok: bool,
+    run_id: []const u8,
+    name: []const u8,
+    state: State,
+    stdout: WindowSlice,
+    stderr: WindowSlice,
+    log_retention: Retention,
+    streams_complete: bool,
+};
+pub const Resources = struct {
+    scope: []const u8,
+    cumulative_for_run: bool,
+    atomic_snapshot: bool,
+    partial: bool,
+    processes: u32,
+    threads: u64,
+    cpu: struct { running_ns: ?u64, runnable_wait_ns: ?u64 },
+    memory: struct { rss_bytes: u64, virtual_bytes: u64, shared_pages_may_be_counted_twice: bool },
+};
+pub const WorkloadStats = struct {
+    run_id: []const u8,
+    name: []const u8,
+    state: State,
+    sampling: enum { observed, unavailable, budget_exhausted },
+    resources: ?Resources,
+};
+
+/// One bounded CLI invocation, not one invocation per row. An unavailable Walker
+/// is an error, never an empty successful inventory or a different backend.
+pub fn inventory(io: Io, a: A, config: Config) Error![]WorkloadSummary {
+    const bytes = try exchange(io, a, config, &.{"ps"}, null, false);
+    const reply = std.json.parseFromSliceLeaky(struct {
+        schema: []const u8,
+        ok: bool,
+        animals: []WorkloadSummary,
+    }, a, bytes, .{ .ignore_unknown_fields = true }) catch return error.WalkerInvalidResponse;
+    if (!reply.ok or !eql(reply.schema, "walker/v2") or reply.animals.len > max_workloads)
+        return error.WalkerInvalidResponse;
+    for (reply.animals, 0..) |row, i| {
+        if (!validRunId(row.run_id) or !validName(row.name) or !validPath(row.cwd) or
+            row.command.len == 0 or row.command.len > process.max_argv_bytes) return error.WalkerInvalidResponse;
+        if (row.pid) |pid| if (pid <= 1) return error.WalkerInvalidResponse;
+        for (reply.animals[0..i]) |previous| {
+            if (eql(previous.run_id, row.run_id) or eql(previous.name, row.name)) return error.WalkerInvalidResponse;
+        }
+    }
+    return reply.animals;
+}
+
+pub fn inspectWorkload(io: Io, a: A, config: Config, id: []const u8) Error!Workload {
+    if (!validRunId(id)) return error.JobNotFound;
+    const bytes = try exchange(io, a, config, &.{ "inspect", id }, null, false);
+    const reply = std.json.parseFromSliceLeaky(struct {
+        schema: []const u8,
+        ok: bool,
+        animal: Workload,
+    }, a, bytes, .{ .ignore_unknown_fields = true }) catch return error.WalkerInvalidResponse;
+    const row = reply.animal;
+    if (!reply.ok or !eql(reply.schema, "walker/v2") or !eql(row.schema, "walker.run/v2") or
+        !eql(row.run_id, id) or !validName(row.name) or !validPath(row.cwd) or row.walker_pid <= 1 or
+        row.argv.len == 0 or row.argv.len > process.max_arguments or row.argv[0].len == 0 or
+        row.output_limit_bytes < 4096 or row.output_limit_bytes > 512 * 1024 * 1024)
+        return error.WalkerInvalidResponse;
+    if (row.pid) |pid| if (pid <= 1) return error.WalkerInvalidResponse;
+    var count: usize = 0;
+    for (row.argv) |argument| {
+        count = std.math.add(usize, count, argument.len) catch return error.WalkerInvalidResponse;
+        if (count > process.max_argv_bytes or std.mem.indexOfScalar(u8, argument, 0) != null)
+            return error.WalkerInvalidResponse;
+    }
+    return row;
+}
+
+/// Byte windows are validated before callers convert binary data to presentation
+/// text. Display replacement characters must never change original byte cursors.
+pub fn workloadLogs(io: Io, a: A, ref: Ref, out: u64, err: u64, max_bytes: u32, tail: ?u32) Error!WorkloadLogs {
+    if (!validRunId(ref.run_id) or !validName(ref.name) or max_bytes < 2 or max_bytes > 32768)
+        return error.WalkerInvalidResponse;
+    var args: std.ArrayList([]const u8) = .empty;
+    defer args.deinit(a);
+    try args.appendSlice(a, &.{ "logs", ref.run_id, "--max-bytes", try std.fmt.allocPrint(a, "{d}", .{max_bytes}) });
+    if (tail) |n| {
+        if (n == 0 or n > 32768 or out != 0 or err != 0) return error.WalkerInvalidResponse;
+        try args.appendSlice(a, &.{ "--tail-bytes", try std.fmt.allocPrint(a, "{d}", .{n}) });
+    } else {
+        try args.appendSlice(a, &.{
+            "--stdout-offset", try std.fmt.allocPrint(a, "{d}", .{out}),
+            "--stderr-offset", try std.fmt.allocPrint(a, "{d}", .{err}),
+        });
+    }
+    const bytes = try exchange(io, a, ref.config, args.items, null, false);
+    var reply = std.json.parseFromSliceLeaky(WorkloadLogs, a, bytes, .{ .ignore_unknown_fields = true }) catch
+        return error.WalkerInvalidResponse;
+    if (!reply.ok or !eql(reply.schema, "walker/v2") or !eql(reply.run_id, ref.run_id) or !eql(reply.name, ref.name))
+        return error.WalkerInvalidResponse;
+    reply.stdout.data = try decodeWindow(a, reply.stdout, if (tail == null) out else null, max_bytes);
+    reply.stderr.data = try decodeWindow(a, reply.stderr, if (tail == null) err else null, max_bytes - reply.stdout.data.len);
+    return reply;
+}
+
+pub fn workloadStats(io: Io, a: A, ref: Ref) Error!WorkloadStats {
+    if (!validRunId(ref.run_id) or !validName(ref.name)) return error.JobNotFound;
+    const bytes = try exchange(io, a, ref.config, &.{ "stats", ref.run_id }, null, false);
+    const reply = std.json.parseFromSliceLeaky(struct {
+        schema: []const u8,
+        ok: bool,
+        animals: []WorkloadStats,
+    }, a, bytes, .{ .ignore_unknown_fields = true }) catch return error.WalkerInvalidResponse;
+    if (!reply.ok or !eql(reply.schema, "walker/v2") or reply.animals.len != 1) return error.WalkerInvalidResponse;
+    const row = reply.animals[0];
+    if (!eql(row.run_id, ref.run_id) or !eql(row.name, ref.name)) return error.WalkerInvalidResponse;
+    return row;
+}
+
+fn decodeWindow(a: A, slice: WindowSlice, requested: ?u64, limit: usize) Error![]const u8 {
+    if (slice.requested_offset != requested or slice.oldest_offset > slice.start_offset or
+        slice.start_offset > slice.next_offset or slice.next_offset > slice.end_offset)
+        return error.WalkerInvalidResponse;
+    if (requested) |offset| {
+        if (slice.start_offset != @max(offset, slice.oldest_offset) or
+            slice.gap_bytes != slice.oldest_offset -| offset) return error.WalkerInvalidResponse;
+    } else if (slice.gap_bytes != 0 or slice.next_offset != slice.end_offset) return error.WalkerInvalidResponse;
+    return decode(a, .{
+        .encoding = slice.encoding,
+        .data = slice.data,
+        .next_offset = slice.next_offset,
+        .eof = slice.eof,
+    }, std.math.cast(usize, slice.start_offset) orelse return error.WalkerInvalidResponse, limit);
+}
+
+pub fn validRunId(id: []const u8) bool {
+    if (id.len != 32) return false;
+    for (id) |byte| if (!std.ascii.isDigit(byte) and (byte < 'a' or byte > 'f')) return false;
+    return true;
+}
+fn validName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 64 or validRunId(name) or eql(name, ".") or eql(name, "..")) return false;
+    for (name) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_' and byte != '.') return false;
+    return true;
+}
+fn validPath(path: []const u8) bool {
+    return std.fs.path.isAbsolute(path) and path.len <= state.max_path_bytes and std.mem.indexOfScalar(u8, path, 0) == null;
+}
+
+test "recent stream gaps are exact and cannot silently renumber data" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var slice = WindowSlice{
+        .encoding = "utf8",
+        .data = "cat",
+        .requested_offset = 2,
+        .oldest_offset = 9,
+        .start_offset = 9,
+        .end_offset = 12,
+        .next_offset = 12,
+        .gap_bytes = 7,
+        .eof = true,
+    };
+    try std.testing.expectEqualStrings("cat", try decodeWindow(a, slice, 2, 3));
+    slice.gap_bytes = 0;
+    try std.testing.expectError(error.WalkerInvalidResponse, decodeWindow(a, slice, 2, 3));
+    slice.requested_offset = null;
+    try std.testing.expectEqualStrings("cat", try decodeWindow(a, slice, null, 3));
+    try std.testing.expectError(error.WalkerInvalidResponse, decodeWindow(a, slice, null, 2));
+    try std.testing.expect(!validRunId("--help"));
+}
