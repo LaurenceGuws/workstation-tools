@@ -40,6 +40,7 @@ Run the live adapter contract suite against an explicitly built Walker, with a p
 ```sh
 zig build walker-driver -Doptimize=ReleaseSafe
 WALKER_BINARY=/absolute/walker WALKER_TEST_ROOT=/absolute/private/fixtures python3 tools/walker_contract.py
+WALKER_BINARY=/absolute/walker WALKER_TEST_ROOT=/absolute/private/fixtures python3 tools/walker_review_contract.py
 ```
 
 The driver is test-only and is not part of any model-facing tool surface. Existing systemd/process receipts remain routed
