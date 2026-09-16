@@ -58,6 +58,7 @@ pub const Error = state.Error || process.Error || environment.Error || walker.Er
     JobControlFailed,
     OffsetOutOfRange,
     ProcessIdentityUnavailable,
+    WalkerBindingMismatch,
 };
 
 /// Arguments admitted when creating one durable job.
@@ -784,6 +785,11 @@ fn validateStored(policy: host_policy.Policy, request: Request, expected_job_id:
         },
         .walker => {
             const ref = request.walker_ref orelse return error.InvalidJob;
+            // Receipts bind historical identity; only current host policy selects executable authority.
+            const configured = policy.walker orelse return error.WalkerBindingMismatch;
+            if (policy.job_backend != .walker or
+                !std.mem.eql(u8, configured.executable, ref.config.executable) or
+                !std.mem.eql(u8, configured.home, ref.config.home)) return error.WalkerBindingMismatch;
             if (!walker.validConfig(ref.config) or !std.mem.eql(u8, ref.run_id, expected_job_id) or
                 !std.mem.startsWith(u8, ref.name, policy.job_unit_prefix) or
                 !std.mem.eql(u8, ref.name[policy.job_unit_prefix.len..], expected_job_id)) return error.InvalidJob;
@@ -1501,4 +1507,31 @@ test "terminal evidence outranks a stale cancellation marker" {
     try std.testing.expectEqual(TerminalState.exited, terminalState(true, "exit-code", "exited", "1"));
     try std.testing.expectEqual(TerminalState.failed, terminalState(true, "resources", "killed", "KILL"));
     try std.testing.expectEqual(TerminalState.exited, terminalState(false, "success", "killed", "TERM"));
+}
+
+test "Walker receipt cannot override current host executable or namespace" {
+    var policy = test_policy;
+    policy.job_backend = .walker;
+    policy.walker = .{ .executable = "/selected/walker", .home = "/selected/state" };
+    const id = "0123456789abcdef0123456789abcdef";
+    var request = Request{
+        .backend = .walker,
+        .walker_ref = .{ .config = policy.walker.?, .run_id = id, .name = "workstation-job-" ++ id },
+        .job_id = id,
+        .argv = &.{"true"},
+        .cwd = "/",
+        .has_stdin = false,
+        .timeout_seconds = 1,
+        .output_limit_bytes = 4096,
+        .created_at = 1,
+    };
+    try validateStored(policy, request, id);
+    request.walker_ref.?.config.executable = "/unselected/program";
+    try std.testing.expectError(error.WalkerBindingMismatch, validateStored(policy, request, id));
+    request.walker_ref.?.config = policy.walker.?;
+    request.walker_ref.?.config.home = "/another/state";
+    try std.testing.expectError(error.WalkerBindingMismatch, validateStored(policy, request, id));
+    request.walker_ref.?.config = policy.walker.?;
+    policy.job_backend = .process;
+    try std.testing.expectError(error.WalkerBindingMismatch, validateStored(policy, request, id));
 }

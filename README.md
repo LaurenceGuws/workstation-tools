@@ -44,3 +44,14 @@ WALKER_BINARY=/absolute/walker WALKER_TEST_ROOT=/absolute/private/fixtures pytho
 
 The driver is test-only and is not part of any model-facing tool surface. Existing systemd/process receipts remain routed
 by their stored backend, not reinterpreted as Walker jobs when the host changes its selection.
+
+
+### Walker identity and text boundaries
+
+A saved Walker reference must match the currently selected host-policy executable and state directory before a read or
+cancellation can invoke any program. Changed configuration reports `WalkerBindingMismatch`; receipts never select an old
+executable or another namespace on the caller's behalf. Rebinding requires an explicit migration, not automatic fallback.
+
+The common tool surface remains text-only: command, shell and job stdout/stderr replace invalid UTF-8 bytes (including partial
+code points at chunk boundaries) with U+FFFD. Job offsets and retention limits still count original bytes. Walker keeps the
+original logs and its CLI exposes lossless UTF-8/base64 chunks, so binary consumers should use that interface directly.

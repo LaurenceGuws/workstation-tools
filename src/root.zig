@@ -296,8 +296,8 @@ fn runProcess(
     defer result.deinit(context.init.gpa);
     var output = object();
     try put(context.allocator, &output, "exit_code", if (result.term) |term| .{ .integer = exitCode(term) } else .null);
-    try put(context.allocator, &output, "stdout", .{ .string = try dupe(context.allocator, result.stdout) });
-    try put(context.allocator, &output, "stderr", .{ .string = try dupe(context.allocator, result.stderr) });
+    try put(context.allocator, &output, "stdout", .{ .string = try outputText(context.allocator, result.stdout) });
+    try put(context.allocator, &output, "stderr", .{ .string = try outputText(context.allocator, result.stderr) });
     try put(context.allocator, &output, "truncated", .{ .bool = result.truncated });
     try put(context.allocator, &output, "timed_out", .{ .bool = result.timed_out });
     return .{ .object = output };
@@ -364,8 +364,8 @@ fn jobRead(context: Context, arguments: std.json.ObjectMap) Error!std.json.Value
         .max_bytes = try optionalPositiveInt(arguments, "max_bytes", jobs.default_read_bytes),
     });
     var output = (try metaValue(context.allocator, result.meta)).object;
-    try put(context.allocator, &output, "stdout", .{ .string = result.stdout });
-    try put(context.allocator, &output, "stderr", .{ .string = result.stderr });
+    try put(context.allocator, &output, "stdout", .{ .string = try outputText(context.allocator, result.stdout) });
+    try put(context.allocator, &output, "stderr", .{ .string = try outputText(context.allocator, result.stderr) });
     try put(context.allocator, &output, "stdout_offset", .{ .integer = @intCast(result.stdout_offset) });
     try put(context.allocator, &output, "stderr_offset", .{ .integer = @intCast(result.stderr_offset) });
     try put(context.allocator, &output, "next_stdout_offset", .{ .integer = @intCast(result.next_stdout_offset) });
@@ -633,6 +633,31 @@ fn object() std.json.ObjectMap {
 
 fn put(allocator: Allocator, output: *std.json.ObjectMap, key: []const u8, value: std.json.Value) Error!void {
     output.put(allocator, key, value) catch return error.OutOfMemory;
+}
+
+/// Tool streams are text. Invalid or split UTF-8 becomes U+FFFD; retained bytes and offsets stay unchanged.
+fn outputText(allocator: Allocator, bytes: []const u8) Error![]u8 {
+    if (std.unicode.utf8ValidateSlice(bytes)) return dupe(allocator, bytes);
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    var index: usize = 0;
+    while (index < bytes.len) {
+        if (validUtf8Prefix(bytes[index..])) |width| {
+            output.appendSlice(allocator, bytes[index..][0..width]) catch return error.OutOfMemory;
+            index += width;
+        } else {
+            output.appendSlice(allocator, "\xef\xbf\xbd") catch return error.OutOfMemory;
+            index += 1;
+        }
+    }
+    return output.toOwnedSlice(allocator) catch error.OutOfMemory;
+}
+
+fn validUtf8Prefix(bytes: []const u8) ?usize {
+    const width = std.unicode.utf8ByteSequenceLength(bytes[0]) catch return null;
+    if (width > bytes.len) return null;
+    _ = std.unicode.utf8Decode(bytes[0..width]) catch return null;
+    return width;
 }
 
 fn dupe(allocator: Allocator, bytes: []const u8) Error![]u8 {
@@ -1216,4 +1241,19 @@ test "workstation shell guard cannot persist Bash history" {
     );
     defer std.testing.allocator.free(after);
     try std.testing.expectEqualStrings("human-history\n", after);
+}
+
+test "tool output preserves text schema for binary bytes and split UTF-8" {
+    const a = std.testing.allocator;
+    const valid = try outputText(a, "dog \xf0\x9f\x90\x95");
+    defer a.free(valid);
+    try std.testing.expectEqualStrings("dog \xf0\x9f\x90\x95", valid);
+    const binary = try outputText(a, &.{ 255, 0, 195, 169 });
+    defer a.free(binary);
+    try std.testing.expectEqualStrings("\xef\xbf\xbd\x00\xc3\xa9", binary);
+    const split = try outputText(a, &.{ 0xf0, 0x9f });
+    defer a.free(split);
+    try std.testing.expectEqualStrings("\xef\xbf\xbd\xef\xbf\xbd", split);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(binary));
+    try std.testing.expect(std.unicode.utf8ValidateSlice(split));
 }
