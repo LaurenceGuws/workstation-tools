@@ -17,3 +17,30 @@ PID/start-time identity and process groups, with bounded stream files, timeout/c
 not claim cgroup-equivalent containment and deliberately does not advertise or accept systemd resource properties. Future OS
 support may add different backend mechanics without changing the small start/read/cancel job surface. Backend selection is a
 host decision; workstation-tools never guesses from what happens to be reachable.
+
+## Walker backend
+
+`Policy.job_backend = .walker` requires an explicit `Policy.walker` with absolute `executable` and `home` paths.
+The package invokes Walker's JSON CLI. It does not import Walker's implementation, speak its socket protocol, or fall back
+when that command is unavailable. The host must deliberately choose the process environment source to avoid user-manager
+lookup; job backend and environment source are separate policy fields.
+
+The tool job ID is exactly the Walker run ID. A stable local binding records that ID, the selected Walker store/executable,
+and launch metadata, while Walker alone owns logs, runtime state and stop escalation. The leash name uses the host prefix
+plus the job ID. This lets a human inspect the same workload with `WALKER_HOME=... walker inspect JOB_ID`.
+
+The existing text start/read/cancel vocabulary is preserved, including 128 KiB stdin, 32 KiB combined incremental reads,
+4 KiB to 512 MiB prefix retention per stream, and finite 1-second to 24-hour workloads. The default retained prefix remains
+1 MiB; accepting a larger cap does not preallocate that amount of memory. `systemd_properties` is not advertised or admitted.
+A cancellation acknowledgement means stop was requested, not that cleanup has completed. Read the terminal state to confirm.
+Lost launch acknowledgements retain the job ID with `indeterminate` state and never trigger replay.
+
+Run the live adapter contract suite against an explicitly built Walker, with a private test root:
+
+```sh
+zig build walker-driver -Doptimize=ReleaseSafe
+WALKER_BINARY=/absolute/walker WALKER_TEST_ROOT=/absolute/private/fixtures python3 tools/walker_contract.py
+```
+
+The driver is test-only and is not part of any model-facing tool surface. Existing systemd/process receipts remain routed
+by their stored backend, not reinterpreted as Walker jobs when the host changes its selection.

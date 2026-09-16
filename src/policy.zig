@@ -10,12 +10,14 @@ pub const max_job_unit_prefix_bytes: usize = 32;
 /// Maximum executable role argument bytes used by durable job helpers.
 pub const max_job_role_argument_bytes: usize = 64;
 pub const EnvironmentSource = environment.Source;
-pub const JobBackend = enum { systemd_user, process };
+pub const JobBackend = enum { systemd_user, process, walker };
+pub const WalkerConfig = @import("walker.zig").Config;
 
 /// Host-selected execution policy. Empty optional markers mean no environment marker is injected.
 pub const Policy = struct {
     environment_source: EnvironmentSource = .user_manager,
     job_backend: JobBackend = .systemd_user,
+    walker: ?WalkerConfig = null,
     agent_marker: ?environment.Marker = null,
     operator_marker: ?environment.Marker = null,
     shell_prelude: []const u8 = "declare -xr HISTFILE=/dev/null;set +o history;",
@@ -26,6 +28,8 @@ pub const Policy = struct {
 
     /// Rejects policy bytes that cannot safely participate in environment names, argv, or systemd unit identity.
     pub fn validate(self: Policy) error{InvalidPolicy}!void {
+        if (self.job_backend == .walker and
+            !@import("walker.zig").validConfig(self.walker orelse return error.InvalidPolicy)) return error.InvalidPolicy;
         if (self.shell_prelude.len > max_shell_prelude_bytes) return error.InvalidPolicy;
         if (!validUnitPrefix(self.job_unit_prefix)) return error.InvalidPolicy;
         if (self.job_backend == .process) {

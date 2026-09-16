@@ -1,6 +1,6 @@
 //! Owns bounded local short-process execution and process-group cleanup.
 //!
-//! Short commands borrow their invocation and return owned bounded streams. systemd owns durable-job process lifetime;
+//! Short commands borrow their invocation and return owned bounded streams. Explicit backends own durable-job lifetime;
 //! durable job receipts live in `jobs.zig`, and MCP/tool naming lives above this module.
 
 const builtin = @import("builtin");
@@ -61,13 +61,30 @@ pub fn run(
     timeout: Io.Duration,
     environ_map: ?*const std.process.Environ.Map,
 ) Error!Result {
+    return runWithBudget(allocator, io, argv, cwd, stdin, timeout, environ_map, .{});
+}
+
+/// Internal command wrapper budget. Payload admission must happen before adding wrapper arguments.
+pub const CommandBudget = struct { arguments: usize = max_arguments, bytes: usize = max_argv_bytes };
+
+/// Executes an already validated command with bounded wrapper overhead, not a wider public tool contract.
+pub fn runWithBudget(
+    allocator: Allocator,
+    io: Io,
+    argv: []const []const u8,
+    cwd: []const u8,
+    stdin: ?[]const u8,
+    timeout: Io.Duration,
+    environ_map: ?*const std.process.Environ.Map,
+    budget: CommandBudget,
+) Error!Result {
     if (comptime builtin.os.tag != .linux) return error.UnsupportedPlatform;
-    if (argv.len == 0 or argv.len > max_arguments or cwd.len == 0) return error.InvalidInvocation;
+    if (argv.len == 0 or argv.len > budget.arguments or cwd.len == 0) return error.InvalidInvocation;
     var argv_bytes: usize = 0;
     for (argv) |argument| {
         if (argument.len == 0) return error.InvalidInvocation;
         argv_bytes = std.math.add(usize, argv_bytes, argument.len) catch return error.InvalidInvocation;
-        if (argv_bytes > max_argv_bytes) return error.InvalidInvocation;
+        if (argv_bytes > budget.bytes) return error.InvalidInvocation;
     }
     if (stdin) |bytes| if (bytes.len > max_stdin_bytes) return error.InvalidInvocation;
 
@@ -110,16 +127,19 @@ pub fn run(
     defer stderr_retained.deinit();
     var timed_out = false;
     var truncated = false;
+    var drain_deadline: ?Io.Clock.Timestamp = null;
 
     while (true) {
-        reader.fill(64, if (timed_out) .none else .{ .deadline = deadline }) catch |failure| switch (failure) {
+        reader.fill(64, .{ .deadline = drain_deadline orelse deadline }) catch |failure| switch (failure) {
             error.EndOfStream => {
                 try retainBounded(&stdout_retained, stdout, &truncated);
                 try retainBounded(&stderr_retained, stderr, &truncated);
                 break;
             },
             error.Timeout => {
+                if (timed_out) break;
                 timed_out = true;
+                drain_deadline = Io.Clock.Timestamp.fromNow(io, .{ .raw = .fromSeconds(1), .clock = .awake });
                 signalGroup(@intCast(child.id.?), .KILL) catch |signal_failure| switch (signal_failure) {
                     error.ProcessNotFound => {},
                     else => return error.SignalFailed,
@@ -132,6 +152,7 @@ pub fn run(
         try retainBounded(&stderr_retained, stderr, &truncated);
         if (!timed_out and deadline.untilNow(io).raw.nanoseconds >= 0) {
             timed_out = true;
+            drain_deadline = Io.Clock.Timestamp.fromNow(io, .{ .raw = .fromSeconds(1), .clock = .awake });
             signalGroup(@intCast(child.id.?), .KILL) catch |signal_failure| switch (signal_failure) {
                 error.ProcessNotFound => {},
                 else => return error.SignalFailed,
@@ -139,11 +160,11 @@ pub fn run(
         }
     }
     reader.checkAnyError() catch return error.StreamFailed;
-    const term = child.wait(io) catch return error.WaitFailed;
+    // EOF is a stream fact, not process completion. Keep the same deadline around wait too.
+    const term = try waitBounded(&child, io, drain_deadline orelse deadline);
+    if (term == null) timed_out = true;
     if (input_task) |*task| {
-        task.await(io) catch {
-            if (!timed_out) return error.StdinWriteFailed;
-        };
+        if (timed_out) task.cancel(io) catch {} else task.await(io) catch return error.StdinWriteFailed;
     }
     const stdout_copy = stdout_retained.toOwnedSlice() catch return error.OutOfMemory;
     errdefer allocator.free(stdout_copy);
@@ -155,6 +176,31 @@ pub fn run(
         .timed_out = timed_out,
         .truncated = truncated,
     };
+}
+
+fn waitBounded(child: *std.process.Child, io: Io, deadline: Io.Clock.Timestamp) Error!?std.process.Child.Term {
+    const Waiter = struct {
+        fn wait(c: *std.process.Child, i: Io, out: *?std.process.Child.Term) Error!void {
+            out.* = c.wait(i) catch return error.WaitFailed;
+        }
+        fn sleep(i: Io, d: Io.Clock.Timestamp) error{Canceled}!void {
+            try d.wait(i);
+        }
+    };
+    const Completion = union(enum) { child: Error!void, deadline: error{Canceled}!void };
+    var slots: [2]Completion = undefined;
+    var select: Io.Select(Completion) = .init(io, &slots);
+    defer select.cancelDiscard();
+    var term: ?std.process.Child.Term = null;
+    select.concurrent(.deadline, Waiter.sleep, .{ io, deadline }) catch return error.WaitFailed;
+    select.concurrent(.child, Waiter.wait, .{ child, io, &term }) catch return error.WaitFailed;
+    const result = select.await() catch return error.WaitFailed;
+    select.cancelDiscard();
+    switch (result) {
+        .child => |r| try r,
+        .deadline => if (child.id != null) terminateGroup(child, io),
+    }
+    return term;
 }
 
 fn writeInput(io: Io, file: Io.File, bytes: []const u8) Io.File.Writer.Error!void {
@@ -291,4 +337,18 @@ test "stdin above the admitted bound is rejected before spawn" {
             null,
         ),
     );
+}
+
+test "deadline survives a child closing both output streams" {
+    var result = try run(
+        std.testing.allocator,
+        std.testing.io,
+        &.{ "/bin/sh", "-c", "exec 1>&- 2>&-; sleep 20" },
+        "/",
+        null,
+        .fromMilliseconds(100),
+        null,
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.timed_out);
 }

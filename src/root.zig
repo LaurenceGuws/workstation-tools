@@ -59,6 +59,7 @@ pub const max_shell_command_bytes: usize =
 pub const Policy = host_policy.Policy;
 pub const EnvironmentSource = host_policy.EnvironmentSource;
 pub const JobBackend = host_policy.JobBackend;
+pub const WalkerConfig = host_policy.WalkerConfig;
 /// Optional environment marker supplied by host policy.
 pub const Marker = environment.Marker;
 
@@ -148,7 +149,14 @@ pub fn description(tool: Tool) []const u8 {
 
 /// Returns the model description after applying host-selected backend details.
 pub fn descriptionForPolicy(policy: Policy, tool: Tool) []const u8 {
-    if (policy.job_backend != .process) return description(tool);
+    if (policy.job_backend == .walker) return switch (tool) {
+        .job_start => "Start one bounded host workload through the explicitly configured Walker CLI. " ++
+            "The returned job ID is also its Walker run ID; no backend fallback is performed.",
+        .job_read => "Read one Walker-owned durable workload and bounded incremental stdout/stderr slices.",
+        .job_cancel => "Request stop of one Walker-owned workload. Read its terminal result to confirm completion.",
+        else => description(tool),
+    };
+    if (policy.job_backend == .systemd_user) return description(tool);
     return switch (tool) {
         .job_start => "Start one bounded long-running argv and return a durable job ID. The host supervisor owns lifetime, " ++
             "timeouts, bounded output, and terminal evidence.",
@@ -213,7 +221,7 @@ pub fn validateArguments(tool: Tool, arguments: std.json.ObjectMap) Error!void {
 /// Rejects backend-specific arguments that are not available on this embedding host.
 pub fn validateArgumentsForPolicy(policy: Policy, tool: Tool, arguments: std.json.ObjectMap) Error!void {
     try validateArguments(tool, arguments);
-    if (policy.job_backend == .process and tool == .job_start and arguments.contains("systemd_properties")) {
+    if (policy.job_backend != .systemd_user and tool == .job_start and arguments.contains("systemd_properties")) {
         return error.InvalidArguments;
     }
 }
@@ -751,7 +759,7 @@ pub fn inputSchemaJson(tool: Tool) []const u8 {
 
 /// Returns the exact input schema after applying host-selected backend capabilities.
 pub fn inputSchemaJsonForPolicy(policy: Policy, tool: Tool) []const u8 {
-    if (policy.job_backend == .process and tool == .job_start) return processJobStartSchemaJson();
+    if (policy.job_backend != .systemd_user and tool == .job_start) return processJobStartSchemaJson();
     return inputSchemaJson(tool);
 }
 
@@ -815,7 +823,7 @@ pub fn outputSchemaJson(tool: Tool) []const u8 {
 
 /// Returns the exact success schema after applying host-selected backend details.
 pub fn outputSchemaJsonForPolicy(policy: Policy, tool: Tool) []const u8 {
-    if (policy.job_backend != .process) return outputSchemaJson(tool);
+    if (policy.job_backend == .systemd_user) return outputSchemaJson(tool);
     return switch (tool) {
         .job_start => processJobMetaSchemaJson(),
         .job_read => processJobReadSchemaJson(),

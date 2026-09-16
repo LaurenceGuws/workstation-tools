@@ -9,6 +9,7 @@ const std = @import("std");
 const environment = @import("environment.zig");
 const process = @import("process.zig");
 const state = @import("state.zig");
+const walker = @import("walker.zig");
 const host_policy = @import("policy.zig");
 
 const Allocator = std.mem.Allocator;
@@ -47,7 +48,7 @@ pub const min_read_bytes: usize = 2;
 pub const default_read_bytes: usize = 24 * 1024;
 
 /// Closed failures from durable job admission, execution, observation, and cancellation.
-pub const Error = state.Error || process.Error || environment.Error || error{
+pub const Error = state.Error || process.Error || environment.Error || walker.Error || error{
     InvalidPolicy,
     InvalidJob,
     JobNotFound,
@@ -134,6 +135,7 @@ pub const CancelResult = struct {
 
 const Request = struct {
     backend: host_policy.JobBackend = .systemd_user,
+    walker_ref: ?walker.Ref = null,
     job_id: []const u8,
     unit: ?[]const u8 = null,
     argv: []const []const u8,
@@ -199,6 +201,7 @@ pub fn start(
 ) Error!Meta {
     try policy.validate();
     try validateStart(init.io, policy, request);
+    if (policy.job_backend == .walker) try walker.check(init.io, policy.walker.?);
     var id: [32]u8 = undefined;
     state.randomHex(init.io, &id);
     const job_id = allocator.dupe(u8, &id) catch return error.OutOfMemory;
@@ -212,10 +215,15 @@ pub fn start(
 
     const unit: ?[]const u8 = switch (policy.job_backend) {
         .systemd_user => try std.fmt.allocPrint(allocator, "{s}{s}.service", .{ policy.job_unit_prefix, id }),
-        .process => null,
+        .process, .walker => null,
     };
     const stored = Request{
         .backend = policy.job_backend,
+        .walker_ref = if (policy.job_backend == .walker) .{
+            .config = policy.walker.?,
+            .run_id = job_id,
+            .name = try std.fmt.allocPrint(allocator, "{s}{s}", .{ policy.job_unit_prefix, job_id }),
+        } else null,
         .job_id = job_id,
         .unit = unit,
         .argv = request.argv,
@@ -234,12 +242,42 @@ pub fn start(
         const stdin_path = try jobPath(&stdin_path_buffer, job_dir, "stdin");
         try state.writeBytesAtomic(init.io, stdin_path, bytes, .fromMode(0o600));
     }
+    if (stored.backend == .walker) {
+        var input_path_buffer: [state.max_path_bytes]u8 = undefined;
+        const input_path = if (request.stdin != null) try jobPath(&input_path_buffer, job_dir, "stdin") else null;
+        defer if (input_path) |path| Io.Dir.cwd().deleteFile(init.io, path) catch {};
+        var env = try environment.current(init, allocator, policy.environment_source, policy.operator_marker);
+        defer env.deinit();
+        if (policy.agent_marker) |marker| try env.put(marker.name, marker.value);
+        // Once submission can occur, keep the binding even on lost acknowledgement. Never replay or erase its ID.
+        launched = true;
+        walker.launch(
+            init.io,
+            allocator,
+            stored.walker_ref.?,
+            request.argv,
+            request.cwd,
+            input_path,
+            request.timeout_seconds,
+            request.output_limit_bytes,
+            &env,
+        ) catch |failure| {
+            if (failure == error.WalkerSubmissionUncertain) {
+                var meta = startingMeta(stored);
+                meta.state = .indeterminate;
+                return meta;
+            }
+            return failure;
+        };
+        return startingMeta(stored);
+    }
     try createEmpty(init.io, job_dir, "stdout");
     try createEmpty(init.io, job_dir, "stderr");
 
     switch (policy.job_backend) {
         .systemd_user => try launchSystemd(init, allocator, policy, executable, job_dir, stored),
         .process => try launchProcess(init, policy, executable, job_dir),
+        .walker => unreachable,
     }
     launched = true;
     return startingMeta(stored);
@@ -316,6 +354,21 @@ pub fn read(
     const job_dir = std.fmt.bufPrint(&job_dir_buffer, "{s}/jobs/{s}", .{ state_dir, request.job_id }) catch
         return error.PathTooLong;
     const stored = try readRequest(io, allocator, policy, job_dir, request.job_id);
+    if (stored.backend == .walker) {
+        const ref = stored.walker_ref.?;
+        const output = try walker.logs(io, allocator, ref, request.stdout_offset, request.stderr_offset, request.max_bytes);
+        return .{
+            .meta = try walkerMeta(stored, try walker.inspect(io, allocator, ref)),
+            .stdout = output.stdout.data,
+            .stderr = output.stderr.data,
+            .stdout_offset = request.stdout_offset,
+            .stderr_offset = request.stderr_offset,
+            .next_stdout_offset = @intCast(output.stdout.next_offset),
+            .next_stderr_offset = @intCast(output.stderr.next_offset),
+            .stdout_eof = output.stdout.eof,
+            .stderr_eof = output.stderr.eof,
+        };
+    }
     const observation = try observe(io, allocator, job_dir, stored);
     var stdout_path_buffer: [state.max_path_bytes]u8 = undefined;
     var stderr_path_buffer: [state.max_path_bytes]u8 = undefined;
@@ -357,6 +410,15 @@ pub fn cancel(
     const job_dir = std.fmt.bufPrint(&job_dir_buffer, "{s}/jobs/{s}", .{ state_dir, job_id }) catch
         return error.PathTooLong;
     const stored = try readRequest(io, allocator, policy, job_dir, job_id);
+    if (stored.backend == .walker) {
+        const requested = try walker.stop(io, allocator, stored.walker_ref.?);
+        const meta = try walkerMeta(stored, try walker.inspect(io, allocator, stored.walker_ref.?));
+        return .{
+            .meta = meta,
+            .cancelled = requested or meta.state == .cancelled,
+            .reason = if (requested) .stop_requested else .already_finished,
+        };
+    }
     const before = try observe(io, allocator, job_dir, stored);
     if (before.terminal_receipt) return .{
         .meta = before.meta,
@@ -367,6 +429,7 @@ pub fn cancel(
     switch (stored.backend) {
         .systemd_user => try requestStop(io, allocator, job_dir, &.{ systemctl, "--user", "stop", stored.unit.? }),
         .process => try requestProcessStop(io, allocator, job_dir),
+        .walker => unreachable,
     }
     const current = try observe(io, allocator, job_dir, stored);
     return .{ .meta = current.meta, .cancelled = true, .reason = .stop_requested };
@@ -411,6 +474,7 @@ pub fn run(init: std.process.Init, policy: host_policy.Policy, job_dir: []const 
     return switch (stored.backend) {
         .systemd_user => runSystemd(init, policy, job_dir, stored),
         .process => runProcessSupervisor(init, policy, job_dir, stored),
+        .walker => error.InvalidJob,
     };
 }
 
@@ -718,6 +782,13 @@ fn validateStored(policy: host_policy.Policy, request: Request, expected_job_id:
             if (!std.mem.eql(u8, unit, expected)) return error.InvalidJob;
             try validateSystemdProperties(request.systemd_properties);
         },
+        .walker => {
+            const ref = request.walker_ref orelse return error.InvalidJob;
+            if (!walker.validConfig(ref.config) or !std.mem.eql(u8, ref.run_id, expected_job_id) or
+                !std.mem.startsWith(u8, ref.name, policy.job_unit_prefix) or
+                !std.mem.eql(u8, ref.name[policy.job_unit_prefix.len..], expected_job_id)) return error.InvalidJob;
+            if (request.unit != null or request.systemd_properties.len != 0) return error.InvalidJob;
+        },
         .process => {
             if (request.unit != null or request.systemd_properties.len != 0) return error.InvalidJob;
         },
@@ -854,6 +925,7 @@ fn observe(io: Io, allocator: Allocator, job_dir: []const u8, request: Request) 
     else switch (request.backend) {
         .systemd_user => try liveSystemdState(io, allocator, request.unit.?),
         .process => try liveProcessState(io, allocator, job_dir),
+        .walker => return error.InvalidJob,
     };
     return .{ .meta = .{
         .job_id = request.job_id,
@@ -870,6 +942,27 @@ fn observe(io: Io, allocator: Allocator, job_dir: []const u8, request: Request) 
         .exit_code = terminalExitCode(result),
         .ended_at = if (result) |terminal_result| terminal_result.ended_at else null,
     }, .terminal_receipt = result != null };
+}
+
+fn walkerMeta(request: Request, observed: walker.Meta) Error!Meta {
+    if (observed.timeout_ms.? != @as(u64, request.timeout_seconds) * 1000 or
+        observed.output_limit_bytes != request.output_limit_bytes) return error.WalkerInvalidResponse;
+    var meta = startingMeta(request);
+    meta.state = switch (observed.state) {
+        .starting => .starting,
+        .running => .running,
+        .stopping => .stopping,
+        .exited => .exited,
+        .stopped => .cancelled,
+        .timed_out => .timed_out,
+        .failed => .failed,
+        .indeterminate => .indeterminate,
+    };
+    meta.exit_code = observed.exit_code;
+    meta.ended_at = if (observed.ended_at_ms) |ms| @divFloor(ms, 1000) else null;
+    meta.stdout_truncated = observed.stdout_discarded_bytes != 0;
+    meta.stderr_truncated = observed.stderr_discarded_bytes != 0;
+    return meta;
 }
 
 fn startingMeta(request: Request) Meta {

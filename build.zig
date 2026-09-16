@@ -12,7 +12,20 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    _ = module;
+    const driver_module = b.createModule(.{
+        .root_source_file = b.path("tools/walker_driver.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    driver_module.addImport("workstation_tools", module);
+    const driver = b.addExecutable(.{
+        .name = "walker-contract-driver",
+        .root_module = driver_module,
+        .use_llvm = !self_hosted,
+        .use_lld = !self_hosted,
+    });
+    const install_driver = b.addInstallArtifact(driver, .{});
+    b.step("walker-driver", "Build the test-only Walker adapter caller").dependOn(&install_driver.step);
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/root.zig"),
