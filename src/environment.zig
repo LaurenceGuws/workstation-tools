@@ -10,7 +10,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Environ = std.process.Environ;
 
-const systemctl = "/usr/bin/systemctl";
+const busctl = "/usr/bin/busctl";
 const query_timeout = Io.Duration.fromSeconds(2);
 
 /// Host-selected source for the environment inherited by workstation payloads.
@@ -97,7 +97,16 @@ fn managerEnvironment(init: std.process.Init, allocator: Allocator) Error!Enviro
     var observed = try process.run(
         init.gpa,
         init.io,
-        &.{ systemctl, "--user", "show-environment" },
+        &.{
+            busctl,
+            "--user",
+            "--json=short",
+            "get-property",
+            "org.freedesktop.systemd1",
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+            "Environment",
+        },
         "/",
         null,
         query_timeout,
@@ -110,7 +119,7 @@ fn managerEnvironment(init: std.process.Init, allocator: Allocator) Error!Enviro
 
     var env = Environ.Map.init(allocator);
     errdefer env.deinit();
-    try parseManagerEnvironment(&env, observed.stdout);
+    try parseManagerEnvironmentJson(&env, observed.stdout);
 
     // These are stable process/user facts, not graphical-session authority. Keep command execution useful on a minimal
     // headless user manager while still allowing a published manager value to win.
@@ -135,16 +144,28 @@ fn managerEnvironment(init: std.process.Init, allocator: Allocator) Error!Enviro
     return env;
 }
 
-fn parseManagerEnvironment(env: *Environ.Map, bytes: []const u8) Error!void {
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        const split = std.mem.indexOfScalar(u8, line, '=') orelse return error.InvalidSessionEnvironment;
-        const key = line[0..split];
-        const value = line[split + 1 ..];
-        if (!Environ.Map.validateKeyForPut(key)) return error.InvalidSessionEnvironment;
-        try env.put(key, value);
-    }
+fn parseManagerEnvironmentJson(env: *Environ.Map, bytes: []const u8) Error!void {
+    var parsed = std.json.parseFromSlice(
+        struct {
+            type: []const u8,
+            data: []const []const u8,
+        },
+        env.allocator,
+        bytes,
+        .{ .ignore_unknown_fields = false },
+    ) catch return error.InvalidSessionEnvironment;
+    defer parsed.deinit();
+
+    if (!std.mem.eql(u8, parsed.value.type, "as")) return error.InvalidSessionEnvironment;
+    for (parsed.value.data) |entry| try putEnvironmentEntry(env, entry);
+}
+
+fn putEnvironmentEntry(env: *Environ.Map, entry: []const u8) Error!void {
+    const split = std.mem.indexOfScalar(u8, entry, '=') orelse return error.InvalidSessionEnvironment;
+    const key = entry[0..split];
+    const value = entry[split + 1 ..];
+    if (!Environ.Map.validateKeyForPut(key)) return error.InvalidSessionEnvironment;
+    try env.put(key, value);
 }
 
 fn parseNulEnvironment(env: *Environ.Map, bytes: []const u8) Error!void {
@@ -198,17 +219,40 @@ fn termSucceeded(term: std.process.Child.Term) bool {
     };
 }
 
-test "manager environment parser preserves values and history isolation overrides later" {
+test "manager environment JSON preserves raw values instead of shell rendering" {
     var env = Environ.Map.init(std.testing.allocator);
     defer env.deinit();
-    try parseManagerEnvironment(
-        &env,
-        "PATH=/usr/bin:/home/test/.local/bin\nWAYLAND_DISPLAY=wayland-9\nXDG_CURRENT_DESKTOP=Hyprland\nVALUE=two words\n",
-    );
+    const payload =
+        \\{"type":"as","data":[
+        \\"PATH=/usr/bin:/home/test/.local/bin",
+        \\"WAYLAND_DISPLAY=wayland-9",
+        \\"XDG_CURRENT_DESKTOP=KDE",
+        \\"VALUE=two words",
+        \\"FZF_DEFAULT_OPTS=--preview 'cat {}' --color=fg:-1,bg:-1"
+        \\]}
+    ;
+    try parseManagerEnvironmentJson(&env, payload);
     try std.testing.expectEqualStrings("/usr/bin:/home/test/.local/bin", env.get("PATH").?);
     try std.testing.expectEqualStrings("wayland-9", env.get("WAYLAND_DISPLAY").?);
-    try std.testing.expectEqualStrings("Hyprland", env.get("XDG_CURRENT_DESKTOP").?);
+    try std.testing.expectEqualStrings("KDE", env.get("XDG_CURRENT_DESKTOP").?);
     try std.testing.expectEqualStrings("two words", env.get("VALUE").?);
+    try std.testing.expectEqualStrings(
+        "--preview 'cat {}' --color=fg:-1,bg:-1",
+        env.get("FZF_DEFAULT_OPTS").?,
+    );
+}
+
+test "manager environment JSON rejects wrong signature and malformed entries" {
+    var env = Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try std.testing.expectError(
+        error.InvalidSessionEnvironment,
+        parseManagerEnvironmentJson(&env, "{\"type\":\"s\",\"data\":[\"PATH=/usr/bin\"]}"),
+    );
+    try std.testing.expectError(
+        error.InvalidSessionEnvironment,
+        parseManagerEnvironmentJson(&env, "{\"type\":\"as\",\"data\":[\"NOT-AN-ASSIGNMENT\"]}"),
+    );
 }
 
 test "NUL environment parser preserves embedded newlines" {
@@ -217,12 +261,6 @@ test "NUL environment parser preserves embedded newlines" {
     try parseNulEnvironment(&env, "PATH=/usr/bin\x00VALUE=line one\nline two\x00");
     try std.testing.expectEqualStrings("/usr/bin", env.get("PATH").?);
     try std.testing.expectEqualStrings("line one\nline two", env.get("VALUE").?);
-}
-
-test "manager environment parser rejects malformed entries" {
-    var env = Environ.Map.init(std.testing.allocator);
-    defer env.deinit();
-    try std.testing.expectError(error.InvalidSessionEnvironment, parseManagerEnvironment(&env, "NOT-AN-ASSIGNMENT\n"));
 }
 
 test "child PATH resolution prefers the supplied session environment" {
