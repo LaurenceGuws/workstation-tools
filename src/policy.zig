@@ -5,6 +5,9 @@ const environment = @import("environment.zig");
 
 /// Maximum consumer-owned shell prelude bytes reserved from the public shell-command budget.
 pub const max_shell_prelude_bytes: usize = 62;
+/// Total executable/option/prelude bytes reserved from the public shell-command budget.
+pub const max_shell_invocation_overhead_bytes: usize =
+    "/bin/bash".len + "-lc".len + max_shell_prelude_bytes;
 /// Maximum systemd unit prefix bytes before the 32-hex job id and `.service` suffix.
 pub const max_job_unit_prefix_bytes: usize = 32;
 /// Maximum executable role argument bytes used by durable job helpers.
@@ -20,6 +23,8 @@ pub const Policy = struct {
     walker: ?WalkerConfig = null,
     agent_marker: ?environment.Marker = null,
     operator_marker: ?environment.Marker = null,
+    shell_executable: []const u8 = "/bin/bash",
+    shell_option: []const u8 = "-lc",
     shell_prelude: []const u8 = "declare -xr HISTFILE=/dev/null;set +o history;",
     job_unit_prefix: []const u8,
     job_launch_argument: ?[]const u8 = null,
@@ -31,6 +36,7 @@ pub const Policy = struct {
         if (self.job_backend == .walker and
             !@import("walker.zig").validConfig(self.walker orelse return error.InvalidPolicy)) return error.InvalidPolicy;
         if (self.shell_prelude.len > max_shell_prelude_bytes) return error.InvalidPolicy;
+        if (!validShell(self.shell_executable, self.shell_option, self.shell_prelude)) return error.InvalidPolicy;
         if (!validUnitPrefix(self.job_unit_prefix)) return error.InvalidPolicy;
         if (self.job_backend == .process) {
             if (!validRoleArgument(self.job_launch_argument orelse return error.InvalidPolicy)) return error.InvalidPolicy;
@@ -44,6 +50,13 @@ pub const Policy = struct {
         if (self.operator_marker) |marker| try validateMarker(marker);
     }
 };
+
+fn validShell(executable: []const u8, option: []const u8, prelude: []const u8) bool {
+    if (executable.len == 0 or !std.fs.path.isAbsolute(executable) or
+        std.mem.indexOfScalar(u8, executable, 0) != null) return false;
+    if (option.len == 0 or option[0] != '-' or std.mem.indexOfScalar(u8, option, 0) != null) return false;
+    return executable.len + option.len + prelude.len <= max_shell_invocation_overhead_bytes;
+}
 
 fn validateMarker(marker: environment.Marker) error{InvalidPolicy}!void {
     if (!std.process.Environ.Map.validateKeyForPut(marker.name) or marker.value.len == 0 or
@@ -85,4 +98,12 @@ test "host policy rejects unsafe markers and job identity bytes" {
     invalid.job_backend = .process;
     invalid.job_launch_argument = null;
     try std.testing.expectError(error.InvalidPolicy, invalid.validate());
+    invalid = valid;
+    invalid.shell_executable = "relative-shell";
+    try std.testing.expectError(error.InvalidPolicy, invalid.validate());
+    invalid = valid;
+    invalid.shell_executable = "/system/bin/sh";
+    invalid.shell_option = "-c";
+    invalid.shell_prelude = "";
+    try invalid.validate();
 }
