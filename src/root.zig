@@ -53,7 +53,7 @@ pub const shell_option = "-lc";
 pub const shell_guard_budget_bytes: usize = host_policy.max_shell_prelude_bytes;
 /// Maximum shell text admitted by the stable public schema.
 pub const max_shell_command_bytes: usize =
-    process.max_argv_bytes - host_policy.max_shell_invocation_overhead_bytes;
+    process.max_argv_bytes - shell_executable.len - shell_option.len - shell_guard_budget_bytes;
 
 /// Host execution policy supplied by the embedding application or transport.
 pub const Policy = host_policy.Policy;
@@ -233,13 +233,10 @@ fn command(context: Context, arguments: std.json.ObjectMap) Error!std.json.Value
 }
 
 fn shell(context: Context, arguments: std.json.ObjectMap) Error!std.json.Value {
+    // Fleet provisions Bash as the login shell on every accepted node. Profiles run normally, then the command starts by
+    // disabling Bash history in a readonly /dev/null lane. Exact non-login or POSIX argv remains `command`'s domain.
     const guarded = try guardedShellCommand(context.allocator, context.policy, try requiredString(arguments, "command"));
-    return runProcess(
-        context,
-        arguments,
-        &.{ context.policy.shell_executable, context.policy.shell_option, guarded },
-        true,
-    );
+    return runProcess(context, arguments, &.{ shell_executable, shell_option, guarded }, true);
 }
 
 fn guardedShellCommand(allocator: Allocator, policy: Policy, command_text: []const u8) Error![]const u8 {

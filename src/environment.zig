@@ -19,7 +19,6 @@ const query_timeout = Io.Duration.fromSeconds(2);
 pub const Source = enum {
     user_manager,
     process,
-    raw_process,
 };
 
 /// Optional environment marker used only while resolving the login-shell environment.
@@ -44,7 +43,7 @@ pub const Error = process.Error || error{
 pub fn current(init: std.process.Init, allocator: Allocator, source: Source, operator_marker: ?Marker) Error!Environ.Map {
     var env = switch (source) {
         .user_manager => try managerEnvironment(init, allocator),
-        .process, .raw_process => blk: {
+        .process => blk: {
             process_environment_mutex.lockUncancelable(init.io);
             defer process_environment_mutex.unlock(init.io);
             break :blk init.environ_map.clone(allocator) catch return error.OutOfMemory;
@@ -55,11 +54,6 @@ pub fn current(init: std.process.Init, allocator: Allocator, source: Source, ope
 
     // Keep the login-shell environment probe completely outside the user's interactive history from process start.
     try env.put("HISTFILE", "/dev/null");
-
-    // Raw hosts such as rescue/root environments deliberately own the complete
-    // child environment and may not even have a login-shell userland. Preserve
-    // those bytes directly instead of forcing a Bash profile snapshot.
-    if (source == .raw_process) return env;
 
     // A consumer may select a richer login profile for the snapshot without leaking that selector into the child payload.
     if (operator_marker) |marker| try env.put(marker.name, marker.value);
@@ -314,41 +308,4 @@ test "process environment source preserves explicit host environment without use
     defer env.deinit();
     try std.testing.expectEqualStrings("process-owned", env.get("WORKSTATION_SOURCE_CANARY").?);
     try std.testing.expectEqualStrings("/dev/null", env.get("HISTFILE").?);
-}
-
-test "raw process environment never invokes the login shell" {
-    var temporary = std.testing.tmpDir(.{});
-    defer temporary.cleanup();
-    const root = try temporary.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
-    defer std.testing.allocator.free(root);
-    const profile = try std.fs.path.join(std.testing.allocator, &.{ root, ".bash_profile" });
-    defer std.testing.allocator.free(profile);
-    const marker = try std.fs.path.join(std.testing.allocator, &.{ root, "profile-ran" });
-    defer std.testing.allocator.free(marker);
-    const file = try Io.Dir.cwd().createFile(std.testing.io, profile, .{ .permissions = .fromMode(0o600) });
-    try file.writeStreamingAll(std.testing.io, "touch \"");
-    try file.writeStreamingAll(std.testing.io, marker);
-    try file.writeStreamingAll(std.testing.io, "\"\n");
-    file.close(std.testing.io);
-
-    var map = Environ.Map.init(std.testing.allocator);
-    defer map.deinit();
-    try map.put("HOME", root);
-    try map.put("PATH", "/usr/bin:/bin");
-    try map.put("WORKSTATION_SOURCE_CANARY", "raw-process-owned");
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const init: std.process.Init = .{
-        .minimal = undefined,
-        .arena = &arena,
-        .gpa = std.testing.allocator,
-        .io = std.testing.io,
-        .environ_map = &map,
-        .preopens = undefined,
-    };
-    var env = try current(init, std.testing.allocator, .raw_process, null);
-    defer env.deinit();
-    try std.testing.expectEqualStrings("raw-process-owned", env.get("WORKSTATION_SOURCE_CANARY").?);
-    try std.testing.expectEqualStrings("/dev/null", env.get("HISTFILE").?);
-    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(std.testing.io, marker, .{}));
 }
