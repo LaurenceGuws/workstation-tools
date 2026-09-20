@@ -94,8 +94,8 @@ pub const Meta = struct {
     timeout_seconds: u32,
     output_limit_bytes: usize,
     systemd_properties: []const []const u8 = &.{},
-    stdout_truncated: bool,
-    stderr_truncated: bool,
+    stdout_truncated: ?bool,
+    stderr_truncated: ?bool,
     exit_code: ?i32 = null,
     ended_at: ?i64 = null,
 };
@@ -202,7 +202,7 @@ pub fn start(
 ) Error!Meta {
     try policy.validate();
     try validateStart(init.io, policy, request);
-    if (policy.job_backend == .walker) try walker.check(init.io, policy.walker.?);
+    if (policy.job_backend == .walker) try walker.check(init.io, allocator, policy.walker.?);
     var id: [32]u8 = undefined;
     state.randomHex(init.io, &id);
     const job_id = allocator.dupe(u8, &id) catch return error.OutOfMemory;
@@ -250,8 +250,6 @@ pub fn start(
         var env = try environment.current(init, allocator, policy.environment_source, policy.operator_marker);
         defer env.deinit();
         if (policy.agent_marker) |marker| try env.put(marker.name, marker.value);
-        // Once submission can occur, keep the binding even on lost acknowledgement. Never replay or erase its ID.
-        launched = true;
         walker.launch(
             init.io,
             allocator,
@@ -264,12 +262,18 @@ pub fn start(
             &env,
         ) catch |failure| {
             if (failure == error.WalkerSubmissionUncertain) {
+                // The immutable run ID may have executed. Preserve the binding
+                // as evidence and never replay this submission.
+                launched = true;
                 var meta = startingMeta(stored);
                 meta.state = .indeterminate;
                 return meta;
             }
+            // Closed known-not-run failures retain no unreachable local
+            // binding; the errdefer removes this private job directory.
             return failure;
         };
+        launched = true;
         return startingMeta(stored);
     }
     try createEmpty(init.io, job_dir, "stdout");
@@ -965,9 +969,9 @@ fn walkerMeta(request: Request, observed: walker.Meta) Error!Meta {
         .indeterminate => .indeterminate,
     };
     meta.exit_code = observed.exit_code;
-    meta.ended_at = if (observed.ended_at_ms) |ms| @divFloor(ms, 1000) else null;
-    meta.stdout_truncated = observed.stdout_discarded_bytes != 0;
-    meta.stderr_truncated = observed.stderr_discarded_bytes != 0;
+    meta.ended_at = if (observed.terminalized_at_ms) |ms| @divFloor(ms, 1000) else null;
+    meta.stdout_truncated = if (observed.stdout_discarded_bytes) |bytes| bytes != 0 else null;
+    meta.stderr_truncated = if (observed.stderr_discarded_bytes) |bytes| bytes != 0 else null;
     return meta;
 }
 

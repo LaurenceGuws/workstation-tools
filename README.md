@@ -22,9 +22,19 @@ host decision; workstation-tools never guesses from what happens to be reachable
 ## Walker backend
 
 `Policy.job_backend = .walker` requires an explicit `Policy.walker` with absolute `executable` and `home` paths.
-The package invokes Walker's JSON CLI. It does not import Walker's implementation, speak its socket protocol, or fall back
-when that command is unavailable. The host must deliberately choose the process environment source to avoid user-manager
-lookup; job backend and environment source are separate policy fields.
+The package invokes Walker's JSON CLI. It does not import Walker's implementation, speak its socket protocol, configure
+cgroups/restart owners, or fall back when that command is unavailable. The host must deliberately choose the process
+environment source to avoid user-manager lookup; job backend and environment source are separate policy fields.
+
+Walker-backed jobs require the current `walker/v5` durable workload contract before workstation-tools creates any job
+state. Admission performs one bounded `walker ping` against the configured executable/home and requires
+`durable_workloads_v1=true`, `restart_owner=platform`, ready delegated admission, and restart reconciliation support.
+A missing Walker reports `WalkerUnavailable`; a reachable but weaker/JIT Walker reports
+`WalkerDurabilityUnavailable`. Neither condition authorizes systemd/process fallback.
+
+Launches explicitly request `delegated_cgroup_v2`. Platform/bootstrap owns `WALKER_CGROUP_ROOT`,
+`WALKER_RESTART_OWNER`, controller delegation, and the finite Walker restart policy. workstation-tools owns none of
+those host mechanics.
 
 The tool job ID is exactly the Walker run ID. A stable local binding records that ID, the selected Walker store/executable,
 and launch metadata, while Walker alone owns logs, runtime state and stop escalation. The leash name uses the host prefix
@@ -35,17 +45,27 @@ The existing text start/read/cancel vocabulary is preserved, including 128 KiB s
 1 MiB; accepting a larger cap does not preallocate that amount of memory. `systemd_properties` is not advertised or admitted.
 A cancellation acknowledgement means stop was requested, not that cleanup has completed. Read the terminal state to confirm.
 Lost launch acknowledgements retain the job ID with `indeterminate` state and never trigger replay.
+If the platform-owned Walker later crashes after acknowledged launch, its successor owns reconciliation. The adapter
+observes the resulting v5 terminal receipt; it never signals a saved PID, adopts a process, or replays argv.
 
-Run the live adapter contract suite against an explicitly built Walker, with a private test root:
+`stdout_truncated` and `stderr_truncated` are required nullable booleans. `false` means exact zero discarded bytes,
+`true` means exact nonzero discarded bytes, and `null` means Walker retained bytes after owner loss but the exact
+discarded count is unknowable. systemd/process jobs currently return non-null values.
+
+Run the live adapter contract suite against an explicitly built, externally platform-owned v5 Walker. `WALKER_HOME`
+must name that already-running Walker's store; the contract itself does not bootstrap systemd or another owner:
 
 ```sh
 zig build walker-driver -Doptimize=ReleaseSafe
-WALKER_BINARY=/absolute/walker WALKER_TEST_ROOT=/absolute/private/fixtures python3 tools/walker_contract.py
-WALKER_BINARY=/absolute/walker WALKER_TEST_ROOT=/absolute/private/fixtures python3 tools/walker_review_contract.py
+WALKER_BINARY=/absolute/walker WALKER_HOME=/absolute/platform/walker-state \
+  WALKER_TEST_ROOT=/absolute/private/fixtures python3 tools/walker_contract.py
+WALKER_BINARY=/absolute/walker WALKER_HOME=/absolute/platform/walker-state \
+  WALKER_TEST_ROOT=/absolute/private/fixtures python3 tools/walker_review_contract.py
 ```
 
-The driver is test-only and is not part of any model-facing tool surface. Existing systemd/process receipts remain routed
-by their stored backend, not reinterpreted as Walker jobs when the host changes its selection.
+The test-only drivers are not part of any model-facing tool surface. The second driver directly exercises Walker
+inventory/detail/log/stats decoding used by operator consumers. Existing systemd/process receipts remain routed by their
+stored backend, not reinterpreted as Walker jobs when the host changes its selection.
 
 
 ### Walker identity and text boundaries

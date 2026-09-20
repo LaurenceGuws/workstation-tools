@@ -9,6 +9,7 @@ pub const Config = struct { executable: []const u8, home: []const u8 };
 pub const Ref = struct { config: Config, run_id: []const u8, name: []const u8 };
 pub const Error = process.Error || state.Error || error{
     WalkerUnavailable,
+    WalkerDurabilityUnavailable,
     WalkerInvalidResponse,
     WalkerRejected,
     WalkerSubmissionUncertain,
@@ -26,9 +27,10 @@ pub const Meta = struct {
     timeout_ms: ?u32,
     output_limit_bytes: u32,
     exit_code: ?i32 = null,
-    ended_at_ms: ?i64 = null,
-    stdout_discarded_bytes: u64 = 0,
-    stderr_discarded_bytes: u64 = 0,
+    terminalized_at_ms: ?i64 = null,
+    reconciled_at_ms: ?i64 = null,
+    stdout_discarded_bytes: ?u64 = 0,
+    stderr_discarded_bytes: ?u64 = 0,
 };
 pub const Slice = struct { encoding: []const u8, data: []const u8, next_offset: u64, eof: bool };
 pub const Logs = struct {
@@ -48,10 +50,33 @@ pub fn validConfig(config: Config) bool {
     return true;
 }
 
-/// Admission checks use only the explicit executable. Missing Walker never selects another process owner.
-pub fn check(io: Io, config: Config) Error!void {
+fn checkExecutable(io: Io, config: Config) Error!void {
     if (!validConfig(config)) return error.WalkerUnavailable;
     Io.Dir.accessAbsolute(io, config.executable, .{ .execute = true }) catch return error.WalkerUnavailable;
+}
+
+/// Durable-job admission proves the explicitly selected Walker is the current v5
+/// durable workload owner before any workstation-tools job state is created.
+pub fn check(io: Io, a: A, config: Config) Error!void {
+    try checkExecutable(io, config);
+    const bytes = try exchange(io, a, config, &.{"ping"}, null, false);
+    const reply = std.json.parseFromSliceLeaky(struct {
+        schema: []const u8,
+        ok: bool,
+        version: u32,
+        delegated_cgroup_v2: bool = false,
+        delegated_cgroup_v2_admission: []const u8 = "",
+        restart_reconciliation_v1: bool = false,
+        restart_owner: []const u8 = "",
+        durable_workloads_v1: bool = false,
+    }, a, bytes, .{ .ignore_unknown_fields = true }) catch return error.WalkerInvalidResponse;
+    if (!reply.ok) return error.WalkerInvalidResponse;
+    if (!eql(reply.schema, "walker/v5") or reply.version != 5)
+        return error.WalkerDurabilityUnavailable;
+    if (!reply.durable_workloads_v1 or !reply.delegated_cgroup_v2 or
+        !eql(reply.delegated_cgroup_v2_admission, "ready") or
+        !reply.restart_reconciliation_v1 or !eql(reply.restart_owner, "platform"))
+        return error.WalkerDurabilityUnavailable;
 }
 
 pub fn launch(
@@ -79,6 +104,8 @@ pub fn launch(
         try std.fmt.allocPrint(a, "{d}", .{@as(u64, timeout_seconds) * 1000}),
         "--output-limit-bytes",
         try std.fmt.allocPrint(a, "{d}", .{output_limit}),
+        "--containment",
+        "delegated_cgroup_v2",
     });
     if (stdin_path) |path| try args.appendSlice(a, &.{ "--stdin-file", path });
     try args.append(a, "--");
@@ -90,7 +117,7 @@ pub fn launch(
         run_id: []const u8,
         name: []const u8,
     }, a, bytes, .{ .ignore_unknown_fields = true }) catch return error.WalkerSubmissionUncertain;
-    if (!reply.ok or !eql(reply.schema, "walker/v2") or !eql(reply.run_id, ref.run_id) or !eql(reply.name, ref.name))
+    if (!reply.ok or !eql(reply.schema, "walker/v5") or !eql(reply.run_id, ref.run_id) or !eql(reply.name, ref.name))
         return error.WalkerSubmissionUncertain;
 }
 
@@ -102,7 +129,7 @@ pub fn inspect(io: Io, a: A, ref: Ref) Error!Meta {
         bytes,
         .{ .ignore_unknown_fields = true },
     ) catch return error.WalkerInvalidResponse;
-    if (!reply.ok or !eql(reply.schema, "walker/v2")) return error.WalkerInvalidResponse;
+    if (!reply.ok or !eql(reply.schema, "walker/v5")) return error.WalkerInvalidResponse;
     try validateMeta(reply.animal, ref);
     return reply.animal;
 }
@@ -120,7 +147,7 @@ pub fn logs(io: Io, a: A, ref: Ref, stdout_offset: usize, stderr_offset: usize, 
     }, null, false);
     var reply = std.json.parseFromSliceLeaky(Logs, a, bytes, .{ .ignore_unknown_fields = true }) catch
         return error.WalkerInvalidResponse;
-    if (!reply.ok or !eql(reply.schema, "walker/v2") or !eql(reply.run_id, ref.run_id) or !eql(reply.name, ref.name))
+    if (!reply.ok or !eql(reply.schema, "walker/v5") or !eql(reply.run_id, ref.run_id) or !eql(reply.name, ref.name))
         return error.WalkerInvalidResponse;
     reply.stdout.data = try decode(a, reply.stdout, stdout_offset, max_bytes);
     reply.stderr.data = try decode(a, reply.stderr, stderr_offset, max_bytes - reply.stdout.data.len);
@@ -136,13 +163,13 @@ pub fn stop(io: Io, a: A, ref: Ref) Error!bool {
         stop_requested: bool,
         completed: bool,
     }, a, bytes, .{}) catch return error.WalkerSubmissionUncertain;
-    if (!reply.ok or !eql(reply.schema, "walker/v2") or !eql(reply.run_id, ref.run_id))
+    if (!reply.ok or !eql(reply.schema, "walker/v5") or !eql(reply.run_id, ref.run_id))
         return error.WalkerSubmissionUncertain;
     return reply.stop_requested;
 }
 
 fn validateMeta(meta: Meta, ref: Ref) Error!void {
-    if (!eql(meta.schema, "walker.run/v2") or !eql(meta.run_id, ref.run_id) or !eql(meta.name, ref.name) or
+    if (!eql(meta.schema, "walker.run/v5") or !eql(meta.run_id, ref.run_id) or !eql(meta.name, ref.name) or
         meta.output_limit_bytes < 4096 or meta.output_limit_bytes > 512 * 1024 * 1024)
         return error.WalkerInvalidResponse;
     const timeout = meta.timeout_ms orelse return error.WalkerInvalidResponse;
@@ -169,7 +196,7 @@ fn exchange(
     source_env: ?*const std.process.Environ.Map,
     mutation: bool,
 ) Error![]const u8 {
-    try check(io, config);
+    try checkExecutable(io, config);
     var env = if (source_env) |value| try value.clone(a) else std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("WALKER_HOME", config.home);
@@ -190,11 +217,13 @@ fn exchange(
         return if (mutation) error.WalkerSubmissionUncertain else error.WalkerUnavailable;
     if (!result.term.?.success()) {
         const failed = std.json.parseFromSliceLeaky(
-            struct { ok: bool, @"error": []const u8 },
+            struct { schema: []const u8, ok: bool, @"error": []const u8 },
             a,
             result.stderr,
             .{ .ignore_unknown_fields = true },
         ) catch
+            return if (mutation) error.WalkerSubmissionUncertain else error.WalkerInvalidResponse;
+        if (failed.ok or !eql(failed.schema, "walker/v5"))
             return if (mutation) error.WalkerSubmissionUncertain else error.WalkerInvalidResponse;
         return failureCode(failed.@"error");
     }
@@ -207,7 +236,10 @@ fn failureCode(code: []const u8) Error {
     if (eql(code, "OffsetOutOfRange")) return error.OffsetOutOfRange;
     if (eql(code, "OwnershipUnavailable")) return error.WalkerOwnershipUnavailable;
     if (eql(code, "HistoryFull")) return error.WalkerHistoryFull;
+    if (eql(code, "PlatformWalkerUnavailable") or eql(code, "DelegatedContainmentUnavailable"))
+        return error.WalkerDurabilityUnavailable;
     if (eql(code, "WalkerUnavailable") or eql(code, "WalkerStartFailed")) return error.WalkerUnavailable;
+    if (eql(code, "ProtocolVersionMismatch")) return error.WalkerInvalidResponse;
     return error.WalkerRejected;
 }
 fn eql(a: []const u8, b: []const u8) bool {
@@ -254,7 +286,8 @@ pub const Workload = struct {
     cwd: []const u8,
     created_at_ms: i64,
     started_at_ms: ?i64,
-    ended_at_ms: ?i64,
+    terminalized_at_ms: ?i64,
+    reconciled_at_ms: ?i64,
     timeout_ms: ?u32,
     log_retention: Retention,
     output_limit_bytes: u32,
@@ -312,7 +345,7 @@ pub fn inventory(io: Io, a: A, config: Config) Error![]WorkloadSummary {
         ok: bool,
         animals: []WorkloadSummary,
     }, a, bytes, .{ .ignore_unknown_fields = true }) catch return error.WalkerInvalidResponse;
-    if (!reply.ok or !eql(reply.schema, "walker/v2") or reply.animals.len > max_workloads)
+    if (!reply.ok or !eql(reply.schema, "walker/v5") or reply.animals.len > max_workloads)
         return error.WalkerInvalidResponse;
     for (reply.animals, 0..) |row, i| {
         if (!validRunId(row.run_id) or !validName(row.name) or !validPath(row.cwd) or
@@ -334,7 +367,7 @@ pub fn inspectWorkload(io: Io, a: A, config: Config, id: []const u8) Error!Workl
         animal: Workload,
     }, a, bytes, .{ .ignore_unknown_fields = true }) catch return error.WalkerInvalidResponse;
     const row = reply.animal;
-    if (!reply.ok or !eql(reply.schema, "walker/v2") or !eql(row.schema, "walker.run/v2") or
+    if (!reply.ok or !eql(reply.schema, "walker/v5") or !eql(row.schema, "walker.run/v5") or
         !eql(row.run_id, id) or !validName(row.name) or !validPath(row.cwd) or row.walker_pid <= 1 or
         row.argv.len == 0 or row.argv.len > process.max_arguments or row.argv[0].len == 0 or
         row.output_limit_bytes < 4096 or row.output_limit_bytes > 512 * 1024 * 1024)
@@ -369,7 +402,7 @@ pub fn workloadLogs(io: Io, a: A, ref: Ref, out: u64, err: u64, max_bytes: u32, 
     const bytes = try exchange(io, a, ref.config, args.items, null, false);
     var reply = std.json.parseFromSliceLeaky(WorkloadLogs, a, bytes, .{ .ignore_unknown_fields = true }) catch
         return error.WalkerInvalidResponse;
-    if (!reply.ok or !eql(reply.schema, "walker/v2") or !eql(reply.run_id, ref.run_id) or !eql(reply.name, ref.name))
+    if (!reply.ok or !eql(reply.schema, "walker/v5") or !eql(reply.run_id, ref.run_id) or !eql(reply.name, ref.name))
         return error.WalkerInvalidResponse;
     reply.stdout.data = try decodeWindow(a, reply.stdout, if (tail == null) out else null, max_bytes);
     reply.stderr.data = try decodeWindow(a, reply.stderr, if (tail == null) err else null, max_bytes - reply.stdout.data.len);
@@ -384,7 +417,7 @@ pub fn workloadStats(io: Io, a: A, ref: Ref) Error!WorkloadStats {
         ok: bool,
         animals: []WorkloadStats,
     }, a, bytes, .{ .ignore_unknown_fields = true }) catch return error.WalkerInvalidResponse;
-    if (!reply.ok or !eql(reply.schema, "walker/v2") or reply.animals.len != 1) return error.WalkerInvalidResponse;
+    if (!reply.ok or !eql(reply.schema, "walker/v5") or reply.animals.len != 1) return error.WalkerInvalidResponse;
     const row = reply.animals[0];
     if (!eql(row.run_id, ref.run_id) or !eql(row.name, ref.name)) return error.WalkerInvalidResponse;
     return row;

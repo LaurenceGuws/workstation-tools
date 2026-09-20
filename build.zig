@@ -25,7 +25,22 @@ pub fn build(b: *std.Build) void {
         .use_lld = !self_hosted,
     });
     const install_driver = b.addInstallArtifact(driver, .{});
-    b.step("walker-driver", "Build the test-only Walker adapter caller").dependOn(&install_driver.step);
+    const observer_module = b.createModule(.{
+        .root_source_file = b.path("tools/walker_observer_driver.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    observer_module.addImport("workstation_tools", module);
+    const observer = b.addExecutable(.{
+        .name = "walker-observer-driver",
+        .root_module = observer_module,
+        .use_llvm = !self_hosted,
+        .use_lld = !self_hosted,
+    });
+    const install_observer = b.addInstallArtifact(observer, .{});
+    const walker_driver = b.step("walker-driver", "Build the test-only Walker adapter callers");
+    walker_driver.dependOn(&install_driver.step);
+    walker_driver.dependOn(&install_observer.step);
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/root.zig"),

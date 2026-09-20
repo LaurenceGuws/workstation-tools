@@ -6,6 +6,7 @@ HERE=Path(__file__).resolve().parent
 WS=Path(os.environ["WALKER_TEST_ROOT"])
 WS.mkdir(parents=True,exist_ok=True,mode=0o700)
 TERMINAL={'exited','timed_out','cancelled','failed'}
+WALKER_TERMINAL={'exited','stopped','timed_out','failed'}
 class AdapterReview(unittest.TestCase):
  @classmethod
  def setUpClass(cls):
@@ -13,13 +14,31 @@ class AdapterReview(unittest.TestCase):
   if libc.prctl(36,1,0,0,0)!=0: raise OSError(ctypes.get_errno(),'subreaper failed')
   cls.host=HERE.parent/'zig-out/bin/walker-contract-driver'
   cls.walker=Path(os.environ['WALKER_BINARY']).resolve()
+  cls.whome=Path(os.environ['WALKER_HOME']).resolve()
   for f in [cls.host,cls.walker]:
    if not f.is_file(): raise RuntimeError('missing binary '+str(f))
+  ping=json.loads(subprocess.check_output([str(cls.walker),'ping'],env=dict(os.environ,WALKER_HOME=str(cls.whome))))
+  if ping.get('schema')!='walker/v5' or not ping.get('durable_workloads_v1') or ping.get('delegated_cgroup_v2_admission')!='ready':
+   raise RuntimeError('Walker fixture is not v5 durable/ready')
  def setUp(self):
-  self.root=Path(tempfile.mkdtemp(prefix='rv-',dir=WS)); self.state=self.root/'tools'; self.whome=self.root/'w'
+  self.root=Path(tempfile.mkdtemp(prefix='rv-',dir=WS)); self.state=self.root/'tools'; self.whome=self.__class__.whome
   self.env=dict(os.environ,HOME=str(self.root),TEST_STATE=str(self.state),TEST_BACKEND='walker',WALKER_BINARY=str(self.walker),WALKER_HOME=str(self.whome),PATH='/usr/bin:/bin',REVIEW_ENV='caller-owned')
   self.calls=0
+  self.run_ids=[]
  def tearDown(self):
+  for run_id in reversed(self.run_ids):
+   deadline=time.monotonic()+5
+   while time.monotonic()<deadline:
+    seen=subprocess.run([str(self.walker),'inspect',run_id],env=self.env,capture_output=True)
+    if seen.returncode: break
+    try: meta=json.loads(seen.stdout)['animal']
+    except (json.JSONDecodeError,KeyError): break
+    if meta['state'] not in WALKER_TERMINAL:
+     subprocess.run([str(self.walker),'stop',run_id],env=self.env,capture_output=True)
+     time.sleep(.04); continue
+    removed=subprocess.run([str(self.walker),'rm',run_id],env=self.env,capture_output=True)
+    if removed.returncode==0: break
+    time.sleep(.04)
   for _ in range(18):
    children=[]
    for path in Path('/proc').glob('[0-9]*/stat'):
@@ -47,7 +66,9 @@ class AdapterReview(unittest.TestCase):
   p=subprocess.run([str(self.host),selected['WALKER_BINARY'],selected['WALKER_HOME'],selected['TEST_STATE'],name,str(req)],env=selected,capture_output=True,timeout=timeout)
   self.assertEqual(p.returncode==0,success,f'{name}: rc={p.returncode}, out={p.stdout[:250]!r}, err={p.stderr[:450]!r}')
   self.assertEqual(p.stderr if success else p.stdout,b'')
-  out=p.stdout if success else p.stderr; self.assertTrue(out.endswith(b'\n')); return json.loads(out)
+  out=p.stdout if success else p.stderr; self.assertTrue(out.endswith(b'\n')); reply=json.loads(out)
+  if success and name=='job_start' and 'job_id' in reply and reply['job_id'] not in self.run_ids: self.run_ids.append(reply['job_id'])
+  return reply
  def job(self,code,options=None,args=(),env=None):
   data=dict(argv=[sys.executable,'-c',code,*args],cwd=str(self.root),timeout_seconds=8)
   data.update(options or {}); return self.tool('job_start',data,env=env)
@@ -66,7 +87,13 @@ class AdapterReview(unittest.TestCase):
   path=self.root/('walker-'+mode); actual=repr(str(self.walker)); once=repr(str(self.root/'once'))
   body='#!'+sys.executable+'\nimport os,sys,json,subprocess\n'
   if mode=='lost-run':
-   body+=f"if sys.argv[1]=='run':\n r=subprocess.run([{actual},*sys.argv[1:]],capture_output=True)\n if r.returncode: sys.stdout.buffer.write(r.stdout);sys.stderr.buffer.write(r.stderr);sys.exit(r.returncode)\n print(json.dumps({{'ok':False,'error':'SubmissionUncertain'}}),file=sys.stderr);sys.exit(1)\n"
+   body+=f"if sys.argv[1]=='run':\n r=subprocess.run([{actual},*sys.argv[1:]],capture_output=True)\n if r.returncode: sys.stdout.buffer.write(r.stdout);sys.stderr.buffer.write(r.stderr);sys.exit(r.returncode)\n print(json.dumps({{'schema':'walker/v5','ok':False,'error':'SubmissionUncertain'}}),file=sys.stderr);sys.exit(1)\n"
+  elif mode=='known-reject':
+   body+="if sys.argv[1]=='run':\n print(json.dumps({'schema':'walker/v5','ok':False,'error':'DelegatedContainmentUnavailable'}),file=sys.stderr);sys.exit(1)\n"
+  elif mode=='unversioned-reject':
+   body+="if sys.argv[1]=='run':\n print(json.dumps({'ok':False,'error':'DelegatedContainmentUnavailable'}),file=sys.stderr);sys.exit(1)\n"
+  elif mode=='old-ping':
+   body+="if sys.argv[1]=='ping':\n print(json.dumps({'schema':'walker/v4','ok':True,'version':4}));sys.exit(0)\n"
   else:
    body+=f"if sys.argv[1]=='inspect' and not os.path.exists({once}):\n open({once},'w').write('yes');print('broken-json');sys.exit(0)\n"
   body+=f'os.execv({actual},[{actual},*sys.argv[1:]])\n'; path.write_text(body); path.chmod(0o700); return path
@@ -84,6 +111,7 @@ class AdapterReview(unittest.TestCase):
   j=self.job('import os,sys;print(os.environ["REVIEW_ENV"]);print("ERR",file=sys.stderr);sys.exit(7)')
   r=self.finish(j['job_id']); self.assertEqual(r['exit_code'],7); self.assertEqual(r['stdout'],'caller-owned\n'); self.assertEqual(r['stderr'],'ERR\n')
   meta=self.walker_cli('inspect',j['job_id'])['animal']; self.assertEqual(meta['run_id'],j['job_id']); self.assertEqual(meta['state'],'exited')
+  self.assertEqual(r['ended_at'],meta['terminalized_at_ms']//1000); self.assertIsNone(meta['reconciled_at_ms'])
   self.assertIsNone(r.get('unit')); self.assertNotIn('systemd_properties',r)
  def test_new_environment_reaches_existing_walker(self):
   keep=self.job('import time;time.sleep(10)')
@@ -93,10 +121,23 @@ class AdapterReview(unittest.TestCase):
   self.assertEqual(a['walker_pid'],b['walker_pid']); self.tool('job_cancel',dict(job_id=keep['job_id'])); self.finish(keep['job_id'])
  def test_missing_walker_cannot_start_legacy_job(self):
   r=self.tool('job_start',dict(argv=['/usr/bin/true'],cwd=str(self.root)),success=False,env=dict(self.env,WALKER_BINARY=str(self.root/'missing')))
-  self.assertIn('Walker',r['error']); self.assertFalse((self.whome/'walker.sock').exists()); self.assertFalse((self.state/'jobs').exists())
+  self.assertIn('Walker',r['error']); self.assertFalse((self.state/'jobs').exists())
+ def test_nondurable_walker_rejected_before_state(self):
+  other=self.root/'nondurable-home'; other_env=dict(self.env,WALKER_HOME=str(other))
+  direct=json.loads(subprocess.check_output([
+   str(self.walker),'run','--name','nondurable-anchor','--cwd',str(self.root),'--','/usr/bin/sleep','2'
+  ],env=other_env))
+  try:
+   ping=json.loads(subprocess.check_output([str(self.walker),'ping'],env=other_env))
+   self.assertFalse(ping['durable_workloads_v1'])
+   r=self.tool('job_start',dict(argv=['/usr/bin/true'],cwd=str(self.root)),success=False,env=other_env)
+   self.assertEqual(r['error'],'WalkerDurabilityUnavailable')
+   self.assertFalse((self.state/'jobs').exists())
+  finally:
+   subprocess.run([str(self.walker),'stop',direct['run_id']],env=other_env,capture_output=True)
  def test_systemd_properties_rejected_before_launch(self):
   self.tool('job_start',dict(argv=['/usr/bin/true'],cwd=str(self.root),systemd_properties=['MemoryMax=1G']),success=False)
-  self.assertFalse((self.whome/'walker.sock').exists())
+  self.assertFalse((self.state/'jobs').exists())
  def test_maximum_argument_count(self):
   j=self.job('import sys;print(len(sys.argv))',args=['x']*253); self.assertEqual(self.finish(j['job_id'])['stdout'],'254\n')
  def test_exact_payload_byte_limit(self):
@@ -131,6 +172,22 @@ class AdapterReview(unittest.TestCase):
   j=self.job(f'open({str(mark)!r},"a").write("one\\n")',env=dict(self.env,WALKER_BINARY=str(wrapper)))
   self.assertEqual(j['state'],'indeterminate'); self.assertRegex(j['job_id'],r'^[0-9a-f]{32}$'); time.sleep(.15); self.assertEqual(mark.read_text(),'one\n')
   self.assertEqual(self.walker_cli('inspect',j['job_id'])['animal']['state'],'exited')
+ def test_known_not_run_failure_removes_local_binding(self):
+  wrapper=self.wrapper('known-reject')
+  r=self.tool('job_start',dict(argv=['/usr/bin/true'],cwd=str(self.root)),success=False,env=dict(self.env,WALKER_BINARY=str(wrapper)))
+  self.assertEqual(r['error'],'WalkerDurabilityUnavailable')
+  jobs=self.state/'jobs'; self.assertFalse(jobs.exists() and any(jobs.iterdir()))
+ def test_unversioned_mutation_error_is_uncertain_not_authority(self):
+  wrapper=self.wrapper('unversioned-reject'); mark=self.root/'must-not-run'
+  j=self.job(f'open({str(mark)!r},"w").write("bad")',env=dict(self.env,WALKER_BINARY=str(wrapper)))
+  self.assertEqual(j['state'],'indeterminate')
+  self.assertTrue((self.state/'jobs'/j['job_id']/'request.json').is_file())
+  self.assertFalse(mark.exists())
+ def test_valid_old_ping_is_nondurable(self):
+  wrapper=self.wrapper('old-ping')
+  r=self.tool('job_start',dict(argv=['/usr/bin/true'],cwd=str(self.root)),success=False,env=dict(self.env,WALKER_BINARY=str(wrapper)))
+  self.assertEqual(r['error'],'WalkerDurabilityUnavailable')
+  jobs=self.state/'jobs'; self.assertFalse(jobs.exists() and any(jobs.iterdir()))
  def test_acknowledged_start_does_not_depend_on_followup_inspection(self):
   j=self.job('print("started")',env=dict(self.env,WALKER_BINARY=str(self.wrapper('lost-inspect'))))
   self.assertEqual(j['state'],'starting'); self.assertRegex(j['job_id'],r'^[0-9a-f]{32}$'); self.assertFalse((self.root/'once').exists())
@@ -152,17 +209,24 @@ class AdapterReview(unittest.TestCase):
  def test_namespace_change_does_not_follow_stored_namespace(self):
   j=self.job('print("complete")'); self.finish(j['job_id'])
   self.tool('job_read',dict(job_id=j['job_id']),success=False,env=dict(self.env,WALKER_HOME=str(self.root/'new-namespace')))
- def test_crashed_owner_is_indeterminate_without_stale_pid_control(self):
+ def test_crashed_platform_owner_reconciles_without_stale_pid_control(self):
   j=self.job('import time;time.sleep(20)'); meta=self.walker_cli('inspect',j['job_id'])['animal']
   fd=os.pidfd_open(meta['walker_pid'])
   try: signal.pidfd_send_signal(fd,signal.SIGKILL)
   finally: os.close(fd)
-  time.sleep(.05); r=self.read(j['job_id']); self.assertEqual(r['state'],'indeterminate')
-  self.tool('job_cancel',dict(job_id=j['job_id']),success=False)
-  # The child must still be alive; the adapter must not independently signal saved PIDs.
-  childfd=os.pidfd_open(meta['pid'])
-  try: signal.pidfd_send_signal(childfd,0)
-  finally: os.close(childfd)
+  end=time.monotonic()+6; r=None
+  while time.monotonic()<end:
+   try: r=self.read(j['job_id'])
+   except AssertionError:
+    time.sleep(.04); continue
+   if r['state'] in TERMINAL: break
+   time.sleep(.04)
+  self.assertIsNotNone(r); self.assertEqual(r['state'],'failed')
+  receipt=self.walker_cli('inspect',j['job_id'])['animal']
+  self.assertEqual(receipt['failure'],'SupervisorLost')
+  self.assertEqual(receipt['cleanup_phase'],'sealed')
+  self.assertEqual(receipt['reconciled_at_ms'],receipt['terminalized_at_ms'])
+  self.assertEqual(r['ended_at'],receipt['terminalized_at_ms']//1000)
  def test_login_profile_selects_sdk_in_exact_command_and_job(self):
   sdk=self.root/'sdk'; (sdk/'bin').mkdir(parents=True)
   java=sdk/'bin/java'; java.write_text('#!/usr/bin/bash\nprintf "sdk=%s\\n" "$JAVA_HOME"\n'); java.chmod(0o700)

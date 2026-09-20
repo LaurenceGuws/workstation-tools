@@ -404,8 +404,8 @@ fn metaValue(allocator: Allocator, meta: jobs.Meta) Error!std.json.Value {
     if (meta.unit != null) {
         try put(allocator, &output, "systemd_properties", try argvValue(allocator, meta.systemd_properties));
     }
-    try put(allocator, &output, "stdout_truncated", .{ .bool = meta.stdout_truncated });
-    try put(allocator, &output, "stderr_truncated", .{ .bool = meta.stderr_truncated });
+    try put(allocator, &output, "stdout_truncated", if (meta.stdout_truncated) |value| .{ .bool = value } else .null);
+    try put(allocator, &output, "stderr_truncated", if (meta.stderr_truncated) |value| .{ .bool = value } else .null);
     if (meta.exit_code) |value| try put(allocator, &output, "exit_code", .{ .integer = value });
     if (meta.ended_at) |value| try put(allocator, &output, "ended_at", .{ .integer = value });
     return .{ .object = output };
@@ -876,8 +876,8 @@ fn jobMetaSchemaJson() []const u8 {
     \\      "type": "array", "maxItems": 16,
     \\      "items": {"type": "string", "minLength": 1, "maxLength": 256}
     \\    },
-    \\    "stdout_truncated": {"type": "boolean"},
-    \\    "stderr_truncated": {"type": "boolean"},
+    \\    "stdout_truncated": {"type": ["boolean", "null"]},
+    \\    "stderr_truncated": {"type": ["boolean", "null"]},
     \\    "exit_code": {"type": "integer"},
     \\    "ended_at": {"type": "integer"}
     \\  },
@@ -905,7 +905,7 @@ fn jobReadSchemaJson() []const u8 {
     \\      "type": "array", "maxItems": 16,
     \\      "items": {"type": "string", "minLength": 1, "maxLength": 256}
     \\    },
-    \\    "stdout_truncated": {"type": "boolean"}, "stderr_truncated": {"type": "boolean"},
+    \\    "stdout_truncated": {"type": ["boolean", "null"]}, "stderr_truncated": {"type": ["boolean", "null"]},
     \\    "exit_code": {"type": "integer"}, "ended_at": {"type": "integer"},
     \\    "stdout": {"type": "string", "maxLength": 32768},
     \\    "stderr": {"type": "string", "maxLength": 32768},
@@ -940,7 +940,7 @@ fn jobCancelSchemaJson() []const u8 {
     \\      "type": "array", "maxItems": 16,
     \\      "items": {"type": "string", "minLength": 1, "maxLength": 256}
     \\    },
-    \\    "stdout_truncated": {"type": "boolean"}, "stderr_truncated": {"type": "boolean"},
+    \\    "stdout_truncated": {"type": ["boolean", "null"]}, "stderr_truncated": {"type": ["boolean", "null"]},
     \\    "exit_code": {"type": "integer"}, "ended_at": {"type": "integer"},
     \\    "cancelled": {"type": "boolean"},
     \\    "reason": {"enum": ["already_finished", "stop_requested"]}
@@ -964,8 +964,8 @@ fn processJobMetaSchemaJson() []const u8 {
     \\    "created_at": {"type": "integer"},
     \\    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 86400},
     \\    "output_limit_bytes": {"type": "integer", "minimum": 4096, "maximum": 536870912},
-    \\    "stdout_truncated": {"type": "boolean"},
-    \\    "stderr_truncated": {"type": "boolean"},
+    \\    "stdout_truncated": {"type": ["boolean", "null"]},
+    \\    "stderr_truncated": {"type": ["boolean", "null"]},
     \\    "exit_code": {"type": "integer"},
     \\    "ended_at": {"type": "integer"}
     \\  },
@@ -988,7 +988,7 @@ fn processJobReadSchemaJson() []const u8 {
     \\    "created_at": {"type": "integer"},
     \\    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 86400},
     \\    "output_limit_bytes": {"type": "integer", "minimum": 4096, "maximum": 536870912},
-    \\    "stdout_truncated": {"type": "boolean"}, "stderr_truncated": {"type": "boolean"},
+    \\    "stdout_truncated": {"type": ["boolean", "null"]}, "stderr_truncated": {"type": ["boolean", "null"]},
     \\    "exit_code": {"type": "integer"}, "ended_at": {"type": "integer"},
     \\    "stdout": {"type": "string", "maxLength": 32768},
     \\    "stderr": {"type": "string", "maxLength": 32768},
@@ -1018,7 +1018,7 @@ fn processJobCancelSchemaJson() []const u8 {
     \\    "created_at": {"type": "integer"},
     \\    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 86400},
     \\    "output_limit_bytes": {"type": "integer", "minimum": 4096, "maximum": 536870912},
-    \\    "stdout_truncated": {"type": "boolean"}, "stderr_truncated": {"type": "boolean"},
+    \\    "stdout_truncated": {"type": ["boolean", "null"]}, "stderr_truncated": {"type": ["boolean", "null"]},
     \\    "exit_code": {"type": "integer"}, "ended_at": {"type": "integer"},
     \\    "cancelled": {"type": "boolean"},
     \\    "reason": {"enum": ["already_finished", "stop_requested"]}
