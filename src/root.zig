@@ -2,6 +2,7 @@
 //!
 //! Calls use request-lifetime allocation, direct process execution, durable job files, and bounded image I/O.
 
+const builtin = @import("builtin");
 const std = @import("std");
 const jobs = @import("jobs.zig");
 const environment = @import("environment.zig");
@@ -1090,6 +1091,7 @@ test "job start validates native systemd resource properties before dispatch" {
 }
 
 test "process tools reject an unavailable working directory before spawn" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     const root = try temporary.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
@@ -1203,6 +1205,7 @@ test "image byte admission rejects corrupt PNG chunks and mismatched formats" {
 }
 
 test "workstation shell guard cannot persist Bash history" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     const root = try temporary.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);

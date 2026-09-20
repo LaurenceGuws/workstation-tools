@@ -57,3 +57,14 @@ executable or another namespace on the caller's behalf. Rebinding requires an ex
 The common tool surface remains text-only: command, shell and job stdout/stderr replace invalid UTF-8 bytes (including partial
 code points at chunk boundaries) with U+FFFD. Job offsets and retention limits still count original bytes. Walker keeps the
 original logs and its CLI exposes lossless UTF-8/base64 chunks, so binary consumers should use that interface directly.
+
+## Test scope across targets
+
+`zig build test` runs schema, validation, decoding and image tests on the selected target. Tests that exercise
+Linux process groups, Bash environment discovery or the Linux durable job store report `SkipZigTest` elsewhere.
+The execution and durable-storage implementations remain Linux-only; passing portable tests does not qualify
+any job backend on Windows. Private-file permissions and directory synchronization are not replaced by weaker defaults.
+
+`zig build check-compile` compiles that test graph without executing the host source audit. The existing
+`zig build check` still requires its Bash-based audit and has not silently dropped that gate. Plain `zig build`
+is an empty install step for this library; use the test/check targets or the explicit `walker-driver` target.
