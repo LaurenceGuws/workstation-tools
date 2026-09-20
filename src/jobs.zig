@@ -5,6 +5,7 @@
 //! Both retain bounded streams and durable receipts. Future OS work should preserve this start/read/cancel surface rather than
 //! pretending the current Linux mechanics are already portable.
 
+const builtin = @import("builtin");
 const std = @import("std");
 const environment = @import("environment.zig");
 const process = @import("process.zig");
@@ -870,6 +871,7 @@ test "process backend rejects systemd-only resource properties" {
 }
 
 test "linux process identity binds pid to proc start time" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     const pid: i32 = @intCast(std.os.linux.getpid());
     const start_time = try processStartTime(std.testing.io, pid);
     try std.testing.expect(try processIdentityAlive(std.testing.io, pid, start_time));
@@ -908,7 +910,7 @@ test "durable job stdin admission matches the shared process bound" {
     var accepted: [process.max_stdin_bytes]u8 = @splat('x');
     try validateStart(std.testing.io, test_policy, .{
         .argv = &.{"true"},
-        .cwd = "/tmp",
+        .cwd = ".",
         .stdin = &accepted,
         .timeout_seconds = 1,
         .output_limit_bytes = min_output_limit_bytes,
@@ -917,7 +919,7 @@ test "durable job stdin admission matches the shared process bound" {
     var rejected: [process.max_stdin_bytes + 1]u8 = @splat('x');
     try std.testing.expectError(error.InvalidJob, validateStart(std.testing.io, test_policy, .{
         .argv = &.{"true"},
-        .cwd = "/tmp",
+        .cwd = ".",
         .stdin = &rejected,
         .timeout_seconds = 1,
         .output_limit_bytes = min_output_limit_bytes,
@@ -1344,6 +1346,7 @@ test "job id validation accepts only canonical lowercase hex" {
 }
 
 test "two-byte job reads advance both streams and reuse unused budget" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     const root = try temporary.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
@@ -1411,6 +1414,7 @@ test "two-byte job reads advance both streams and reuse unused budget" {
 }
 
 test "job control rejects swapped identity and arbitrary unit before writing a marker" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     const root = try temporary.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
@@ -1437,6 +1441,7 @@ test "job control rejects swapped identity and arbitrary unit before writing a m
 }
 
 test "indeterminate observation is not EOF or an already-finished cancellation" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     const root = try temporary.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
@@ -1484,6 +1489,7 @@ fn testRequest(job_id: []const u8) Request {
 }
 
 test "failed stop removes its cancellation marker" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     const root = try temporary.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);

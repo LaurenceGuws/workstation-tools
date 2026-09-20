@@ -229,6 +229,7 @@ fn terminateGroup(child: *std.process.Child, io: Io) void {
 }
 
 test "bounded process keeps stdout and stderr separate" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     var result = try run(
         std.testing.allocator,
         std.testing.io,
@@ -247,6 +248,7 @@ test "bounded process keeps stdout and stderr separate" {
 }
 
 test "excess process output is retained to the exact bound" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     var result = try run(
         std.testing.allocator,
         std.testing.io,
@@ -267,7 +269,7 @@ test "excess process output is retained to the exact bound" {
 }
 
 test "timeout terminates descendants in the child process group" {
-    if (builtin.os.tag != .linux) return;
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     const root = try temporary.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
@@ -308,6 +310,7 @@ test "timeout terminates descendants in the child process group" {
 }
 
 test "timeout includes stdin rejected before the child exits" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     var input: [max_stdin_bytes]u8 = @splat('x');
     var result = try run(
         std.testing.allocator,
@@ -324,6 +327,7 @@ test "timeout includes stdin rejected before the child exits" {
 }
 
 test "stdin above the admitted bound is rejected before spawn" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     var input: [max_stdin_bytes + 1]u8 = @splat('x');
     try std.testing.expectError(
         error.InvalidInvocation,
@@ -340,6 +344,7 @@ test "stdin above the admitted bound is rejected before spawn" {
 }
 
 test "deadline survives a child closing both output streams" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     var result = try run(
         std.testing.allocator,
         std.testing.io,
@@ -351,4 +356,17 @@ test "deadline survives a child closing both output streams" {
     );
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(result.timed_out);
+}
+
+test "unsupported hosts reject process execution before spawning" {
+    if (builtin.os.tag == .linux) return error.SkipZigTest;
+    try std.testing.expectError(error.UnsupportedPlatform, run(
+        std.testing.allocator,
+        std.testing.io,
+        &.{"must-not-be-spawned"},
+        ".",
+        null,
+        .fromMilliseconds(1),
+        null,
+    ));
 }

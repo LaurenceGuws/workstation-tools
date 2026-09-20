@@ -57,3 +57,11 @@ executable or another namespace on the caller's behalf. Rebinding requires an ex
 The common tool surface remains text-only: command, shell and job stdout/stderr replace invalid UTF-8 bytes (including partial
 code points at chunk boundaries) with U+FFFD. Job offsets and retention limits still count original bytes. Walker keeps the
 original logs and its CLI exposes lossless UTF-8/base64 chunks, so binary consumers should use that interface directly.
+
+## Native contract tests
+
+`zig build test` retains host-independent schema, validation, byte-admission, and parsing tests on every target.
+Tests that exercise the existing Linux process, shell, or durable-state backend explicitly report `SkipZigTest` elsewhere.
+A passing non-Linux test lane is not an implemented execution backend: short-process execution still returns
+`UnsupportedPlatform`, and the Walker driver remains blocked on unimplemented native durable-state mechanics.
+The `check` step also runs the existing Unix source audit and therefore needs its Bash/tool prerequisites.

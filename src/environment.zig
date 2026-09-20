@@ -3,6 +3,7 @@
 //! Long-lived agent services cannot treat their startup environment as the current desktop/session environment. The systemd
 //! user manager is the Linux session handoff point; each payload takes one bounded fresh snapshot immediately before spawn.
 
+const builtin = @import("builtin");
 const std = @import("std");
 const process = @import("process.zig");
 
@@ -264,6 +265,7 @@ test "NUL environment parser preserves embedded newlines" {
 }
 
 test "child PATH resolution prefers the supplied session environment" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     const root = try temporary.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
@@ -289,6 +291,7 @@ test "child PATH resolution prefers the supplied session environment" {
 }
 
 test "process environment source preserves explicit host environment without user manager" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     var map = Environ.Map.init(std.testing.allocator);
     defer map.deinit();
     try map.put("HOME", "/tmp");
