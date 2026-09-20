@@ -311,6 +311,7 @@ os.execv({str(self.walker)!r},[{str(self.walker)!r},*sys.argv[1:]])
             time.sleep(.04)
         else: self.fail("successor did not reconcile crashed Walker job")
         self.assertEqual(view["state"],"failed")
+        self.assertTrue(view["stdout_eof"] and view["stderr_eof"])
         receipt=json.loads(subprocess.check_output([str(self.walker),"inspect",r["job_id"]],env=self.env))["animal"]
         self.assertEqual(receipt["failure"],"SupervisorLost")
         self.assertEqual(receipt["cleanup_phase"],"sealed")

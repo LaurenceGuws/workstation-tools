@@ -367,9 +367,13 @@ pub fn read(
     const stored = try readRequest(io, allocator, policy, job_dir, request.job_id);
     if (stored.backend == .walker) {
         const ref = stored.walker_ref.?;
+        // Observe lifecycle before streams. Walker terminal state is irreversible, so
+        // a terminal metadata snapshot cannot be paired with pre-terminal EOF flags
+        // if reconciliation lands between these two CLI exchanges.
+        const meta = try walkerMeta(stored, try walker.inspect(io, allocator, ref));
         const output = try walker.logs(io, allocator, ref, request.stdout_offset, request.stderr_offset, request.max_bytes);
         return .{
-            .meta = try walkerMeta(stored, try walker.inspect(io, allocator, ref)),
+            .meta = meta,
             .stdout = output.stdout.data,
             .stderr = output.stderr.data,
             .stdout_offset = request.stdout_offset,

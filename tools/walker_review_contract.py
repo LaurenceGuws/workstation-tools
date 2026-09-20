@@ -232,7 +232,7 @@ class AdapterReview(unittest.TestCase):
     time.sleep(.04); continue
    if r['state'] in TERMINAL: break
    time.sleep(.04)
-  self.assertIsNotNone(r); self.assertEqual(r['state'],'failed')
+  self.assertIsNotNone(r); self.assertEqual(r['state'],'failed'); self.assertTrue(r['stdout_eof'] and r['stderr_eof'])
   receipt=self.walker_cli('inspect',j['job_id'])['animal']
   self.assertEqual(receipt['failure'],'SupervisorLost')
   self.assertEqual(receipt['cleanup_phase'],'sealed')
