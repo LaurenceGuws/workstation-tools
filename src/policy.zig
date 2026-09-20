@@ -3,49 +3,23 @@
 const std = @import("std");
 const environment = @import("environment.zig");
 
-/// Maximum consumer-owned shell prelude bytes reserved from the public shell-command budget.
 pub const max_shell_prelude_bytes: usize = 62;
-/// Maximum systemd unit prefix bytes before the 32-hex job id and `.service` suffix.
-pub const max_job_unit_prefix_bytes: usize = 32;
-/// Maximum executable role argument bytes used by durable job helpers.
-pub const max_job_role_argument_bytes: usize = 64;
+pub const max_job_name_prefix_bytes: usize = 32;
 pub const EnvironmentSource = environment.Source;
-pub const JobBackend = enum { systemd_user, process, walker };
 pub const WalkerConfig = @import("walker.zig").Config;
 
-/// Host-selected execution policy. Empty optional markers mean no environment marker is injected.
 pub const Policy = struct {
     environment_source: EnvironmentSource = .user_manager,
-    job_backend: JobBackend = .systemd_user,
-    walker: ?WalkerConfig = null,
+    walker: WalkerConfig,
     agent_marker: ?environment.Marker = null,
     operator_marker: ?environment.Marker = null,
     shell_prelude: []const u8 = "declare -xr HISTFILE=/dev/null;set +o history;",
-    job_unit_prefix: []const u8,
-    job_launch_argument: ?[]const u8 = null,
-    job_run_argument: ?[]const u8 = null,
-    job_finish_argument: ?[]const u8 = null,
+    job_name_prefix: []const u8,
 
-    /// Rejects policy bytes that cannot safely participate in environment names, argv, or systemd unit identity.
     pub fn validate(self: Policy) error{InvalidPolicy}!void {
-        if (self.job_backend == .walker and
-            !@import("walker.zig").validConfig(self.walker orelse return error.InvalidPolicy)) return error.InvalidPolicy;
+        if (!@import("walker.zig").validConfig(self.walker)) return error.InvalidPolicy;
         if (self.shell_prelude.len > max_shell_prelude_bytes) return error.InvalidPolicy;
-        if (!validUnitPrefix(self.job_unit_prefix)) return error.InvalidPolicy;
-        if (self.job_launch_argument) |argument| if (!validRoleArgument(argument)) return error.InvalidPolicy;
-        if (self.job_run_argument) |argument| if (!validRoleArgument(argument)) return error.InvalidPolicy;
-        if (self.job_finish_argument) |argument| if (!validRoleArgument(argument)) return error.InvalidPolicy;
-        switch (self.job_backend) {
-            .systemd_user => {
-                _ = self.job_run_argument orelse return error.InvalidPolicy;
-                _ = self.job_finish_argument orelse return error.InvalidPolicy;
-            },
-            .process => {
-                _ = self.job_launch_argument orelse return error.InvalidPolicy;
-                _ = self.job_run_argument orelse return error.InvalidPolicy;
-            },
-            .walker => {},
-        }
+        if (!validJobNamePrefix(self.job_name_prefix)) return error.InvalidPolicy;
         if (self.agent_marker) |marker| try validateMarker(marker);
         if (self.operator_marker) |marker| try validateMarker(marker);
     }
@@ -53,48 +27,30 @@ pub const Policy = struct {
 
 fn validateMarker(marker: environment.Marker) error{InvalidPolicy}!void {
     if (!std.process.Environ.Map.validateKeyForPut(marker.name) or marker.value.len == 0 or
-        std.mem.indexOfScalar(u8, marker.value, 0) != null)
-    {
-        return error.InvalidPolicy;
-    }
+        std.mem.indexOfScalar(u8, marker.value, 0) != null) return error.InvalidPolicy;
 }
 
-fn validUnitPrefix(value: []const u8) bool {
-    if (value.len == 0 or value.len > max_job_unit_prefix_bytes) return false;
+fn validJobNamePrefix(value: []const u8) bool {
+    if (value.len == 0 or value.len > max_job_name_prefix_bytes) return false;
     for (value) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_') return false;
     return true;
 }
 
-fn validRoleArgument(value: []const u8) bool {
-    if (value.len < 3 or value.len > max_job_role_argument_bytes or !std.mem.startsWith(u8, value, "--")) return false;
-    for (value[2..]) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '-') return false;
-    return true;
-}
-
-test "host policy rejects unsafe markers and job identity bytes" {
+test "host policy requires exact Walker binding and safe names" {
     const valid = Policy{
+        .walker = .{ .executable = "/selected/walker", .home = "/selected/state" },
         .agent_marker = .{ .name = "AGENT_CHILD", .value = "1" },
         .operator_marker = .{ .name = "OPERATOR_PROFILE", .value = "1" },
-        .job_unit_prefix = "agent-job-",
-        .job_launch_argument = "--job-launch",
-        .job_run_argument = "--job-run",
-        .job_finish_argument = "--job-finish",
+        .job_name_prefix = "agent-job-",
     };
     try valid.validate();
     var invalid = valid;
-    invalid.job_unit_prefix = "bad/prefix";
+    invalid.job_name_prefix = "bad/prefix";
     try std.testing.expectError(error.InvalidPolicy, invalid.validate());
     invalid = valid;
     invalid.agent_marker = .{ .name = "BAD=NAME", .value = "1" };
     try std.testing.expectError(error.InvalidPolicy, invalid.validate());
     invalid = valid;
-    invalid.job_backend = .process;
-    invalid.job_launch_argument = null;
+    invalid.walker.executable = "walker";
     try std.testing.expectError(error.InvalidPolicy, invalid.validate());
-    invalid = valid;
-    invalid.job_backend = .walker;
-    invalid.walker = .{ .executable = "/selected/walker", .home = "/selected/state" };
-    invalid.job_run_argument = null;
-    invalid.job_finish_argument = null;
-    try invalid.validate();
 }

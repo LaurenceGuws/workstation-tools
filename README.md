@@ -11,26 +11,24 @@ long-lived desktop agents. An isolated host such as a container may instead sele
 process environment and still runs the same bounded login-shell environment normalization. The package never guesses between
 those environments from filesystem or process-manager availability.
 
-Durable jobs likewise use an explicit `Policy.job_backend`. Current server support is Linux. `systemd_user` preserves the
-existing transient-user-service backend, including cgroup lifetime, native resource controls and restart-independent
-observation. The current `process` backend is the small Linux fallback: a detached package-owned supervisor using `/proc`
-PID/start-time identity and process groups, with bounded stream files, timeout/cancel handling and terminal receipts. It does
-not claim cgroup-equivalent containment and deliberately does not advertise or accept systemd resource properties. Future OS
-support may add different backend mechanics without changing the small start/read/cancel job surface. Backend selection is a
-host decision; workstation-tools never guesses from what happens to be reachable.
+Durable jobs have one owner: the exact Walker selected by `Policy.walker`. workstation-tools no longer launches transient
+systemd services or a package-owned detached process supervisor, and there is no backend-selection or availability fallback
+surface. Historical systemd/process request directories remain readable as inert evidence: explicit terminal receipts and
+retained streams can still be observed, while a legacy record without terminal evidence remains `indeterminate` and cannot be
+cancelled. Those compatibility decoders never invoke systemd, inspect saved PIDs, or regain process-control authority.
 
 ## Walker backend
 
-`Policy.job_backend = .walker` requires an explicit `Policy.walker` with absolute `executable` and `home` paths.
+`Policy.walker` requires absolute `executable` and `home` paths.
 The package invokes Walker's JSON CLI. It does not import Walker's implementation, speak its socket protocol, configure
-cgroups/restart owners, or fall back when that command is unavailable. The host must deliberately choose the process
-environment source to avoid user-manager lookup; job backend and environment source are separate policy fields.
+cgroups/restart owners, or fall back when that command is unavailable. The host may independently choose the child-process
+environment source; that setting does not select durable-job ownership.
 
 Walker-backed jobs require the current `walker/v5` durable workload contract before workstation-tools creates any job
 state. Admission performs one bounded `walker ping` against the configured executable/home and requires
 `durable_workloads_v1=true`, `restart_owner=platform`, ready delegated admission, and restart reconciliation support.
 A missing Walker reports `WalkerUnavailable`; a reachable but weaker/JIT Walker reports
-`WalkerDurabilityUnavailable`. Neither condition authorizes systemd/process fallback.
+`WalkerDurabilityUnavailable`. Neither condition authorizes another owner.
 
 Launches explicitly request `delegated_cgroup_v2`. Platform/bootstrap owns `WALKER_CGROUP_ROOT`,
 `WALKER_RESTART_OWNER`, controller delegation, and the finite Walker restart policy. workstation-tools owns none of
@@ -57,7 +55,7 @@ observes the resulting v5 terminal receipt; it never signals a saved PID, adopts
 
 `stdout_truncated` and `stderr_truncated` are required nullable booleans. `false` means exact zero discarded bytes,
 `true` means exact nonzero discarded bytes, and `null` means Walker retained bytes after owner loss but the exact
-discarded count is unknowable. systemd/process jobs currently return non-null values.
+discarded count is unknowable. Read-only legacy terminal evidence returns non-null truncation facts from its retained markers.
 
 Run the live adapter contract suite against an explicitly built, externally platform-owned v5 Walker. `WALKER_HOME`
 must name that already-running Walker's store; the contract itself does not bootstrap systemd or another owner:
@@ -71,8 +69,8 @@ WALKER_BINARY=/absolute/walker WALKER_HOME=/absolute/platform/walker-state \
 ```
 
 The test-only drivers are not part of any model-facing tool surface. The second driver directly exercises Walker
-inventory/detail/log/stats decoding used by operator consumers. Existing systemd/process receipts remain routed by their
-stored backend, not reinterpreted as Walker jobs when the host changes its selection.
+inventory/detail/log/stats decoding used by operator consumers. Existing systemd/process receipts are decoded locally as
+read-only historical evidence and are never reinterpreted as Walker jobs.
 
 
 ### Walker identity and text boundaries
