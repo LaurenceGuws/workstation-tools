@@ -4,6 +4,8 @@ Small bounded Zig workstation operations for agent runtimes and transports.
 
 This package owns execution mechanics and their base schemas. It does not own MCP, HTTP, agent/session identity, conversation state, Activity/Chronicle logging, Fleet topology, authentication, or UI presentation.
 
+`zig build test` keeps host-independent schema/resource/text contracts available on unsupported targets while explicitly skipping fixtures that require Linux process groups, executable-mode bits or the current durable-state implementation. `zig build check-compile` proves that portable Zig graph without invoking the Bash source audit; the normal Linux `zig build check` remains the complete compile-plus-audit gate. These test/build seams do not advertise a non-Linux execution backend.
+
 Embedding hosts explicitly select where child-process environment comes from through `Policy.environment_source`. The default
 `user_manager` source snapshots the current systemd user-manager environment before each process or durable job through
 the manager's D-Bus `Environment` property, preserving raw values rather than parsing `systemctl`'s shell-rendered output. This suits

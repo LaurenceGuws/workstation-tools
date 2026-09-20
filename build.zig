@@ -50,6 +50,7 @@ pub fn build(b: *std.Build) void {
         .use_llvm = !self_hosted,
         .use_lld = !self_hosted,
     });
+    b.step("check-compile", "Compile workstation tool tests without the host source audit").dependOn(&tests.step);
     const audit_run = b.addSystemCommand(&.{ "bash", "tools/audit_source.sh" });
     audit_run.setCwd(b.path("."));
     const check = b.step("check", "Compile and audit workstation tools and tests");

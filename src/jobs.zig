@@ -4,6 +4,7 @@
 //! request files remain readable as inert evidence only; they never regain
 //! launch, signal, adoption, or service-manager authority.
 
+const builtin = @import("builtin");
 const std = @import("std");
 const environment = @import("environment.zig");
 const process = @import("process.zig");
@@ -533,7 +534,7 @@ test "durable job stdin admission matches the shared process bound" {
     var accepted: [process.max_stdin_bytes]u8 = @splat('x');
     try validateStart(std.testing.io, .{
         .argv = &.{"true"},
-        .cwd = "/tmp",
+        .cwd = ".",
         .stdin = &accepted,
         .timeout_seconds = 1,
         .output_limit_bytes = min_output_limit_bytes,
@@ -541,7 +542,7 @@ test "durable job stdin admission matches the shared process bound" {
     var rejected: [process.max_stdin_bytes + 1]u8 = @splat('x');
     try std.testing.expectError(error.InvalidJob, validateStart(std.testing.io, .{
         .argv = &.{"true"},
-        .cwd = "/tmp",
+        .cwd = ".",
         .stdin = &rejected,
         .timeout_seconds = 1,
         .output_limit_bytes = min_output_limit_bytes,
@@ -549,6 +550,7 @@ test "durable job stdin admission matches the shared process bound" {
 }
 
 test "legacy systemd terminal evidence remains readable without control authority" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     const root = try temporary.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
@@ -592,6 +594,7 @@ test "legacy systemd terminal evidence remains readable without control authorit
 }
 
 test "unterminated legacy evidence stays indeterminate and cannot be controlled" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     const root = try temporary.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
