@@ -43,6 +43,13 @@ plus the job ID. This lets a human inspect the same workload with `WALKER_HOME=.
 The existing text start/read/cancel vocabulary is preserved, including 128 KiB stdin, 32 KiB combined incremental reads,
 4 KiB to 512 MiB prefix retention per stream, and finite 1-second to 24-hour workloads. The default retained prefix remains
 1 MiB; accepting a larger cap does not preallocate that amount of memory. `systemd_properties` is not advertised or admitted.
+Walker policy instead exposes one portable typed `resources` object containing
+`memory_max_bytes`, `memory_pressure_bytes`, `swap_max_bytes`, `tasks_max`,
+`cpu_max_us_per_second`, `cpu_weight`, and `io_weight`. Relative weights use the
+portable 1–10000 domain. Admission is request-specific: before creating local job state,
+workstation-tools requires the selected Walker to report every requested semantic ready.
+Missing delegation therefore fails closed as `WalkerResourceUnavailable` instead of
+silently dropping a control or selecting another backend.
 A cancellation acknowledgement means stop was requested, not that cleanup has completed. Read the terminal state to confirm.
 Lost launch acknowledgements retain the job ID with `indeterminate` state and never trigger replay.
 If the platform-owned Walker later crashes after acknowledged launch, its successor owns reconciliation. The adapter

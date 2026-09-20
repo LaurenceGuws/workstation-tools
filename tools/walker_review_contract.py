@@ -20,6 +20,7 @@ class AdapterReview(unittest.TestCase):
   ping=json.loads(subprocess.check_output([str(cls.walker),'ping'],env=dict(os.environ,WALKER_HOME=str(cls.whome))))
   if ping.get('schema')!='walker/v5' or not ping.get('durable_workloads_v1') or ping.get('delegated_cgroup_v2_admission')!='ready':
    raise RuntimeError('Walker fixture is not v5 durable/ready')
+  cls.resource_controls=ping.get('resource_controls',{})
  def setUp(self):
   self.root=Path(tempfile.mkdtemp(prefix='rv-',dir=WS)); self.state=self.root/'tools'; self.whome=self.__class__.whome
   self.env=dict(os.environ,HOME=str(self.root),TEST_STATE=str(self.state),TEST_BACKEND='walker',WALKER_BINARY=str(self.walker),WALKER_HOME=str(self.whome),PATH='/usr/bin:/bin',REVIEW_ENV='caller-owned')
@@ -138,6 +139,16 @@ class AdapterReview(unittest.TestCase):
  def test_systemd_properties_rejected_before_launch(self):
   self.tool('job_start',dict(argv=['/usr/bin/true'],cwd=str(self.root),systemd_properties=['MemoryMax=1G']),success=False)
   self.assertFalse((self.state/'jobs').exists())
+ def test_portable_resources_are_exact_walker_requests(self):
+  if not all(self.resource_controls.get(key) for key in ('memory_max_bytes','memory_pressure_bytes','swap_max_bytes','tasks_max','cpu_max_us_per_second','cpu_weight','io_weight')):
+   self.skipTest('fixture does not delegate all typed resource controllers')
+  requested=dict(memory_max_bytes=512*1024*1024,memory_pressure_bytes=256*1024*1024,swap_max_bytes=512*1024*1024,tasks_max=256,cpu_max_us_per_second=1_000_000,cpu_weight=77,io_weight=88)
+  j=self.job('print("resources",flush=True)',options=dict(resources=requested))
+  self.assertEqual(j['resources'],requested)
+  r=self.finish(j['job_id']); self.assertEqual(r['resources'],requested)
+  meta=self.walker_cli('inspect',j['job_id'])['animal']
+  self.assertEqual(meta['resources_requested'],requested)
+  for key,value in requested.items(): self.assertEqual(meta['resources_effective'][key],value,(key,meta['resources_effective']))
  def test_maximum_argument_count(self):
   j=self.job('import sys;print(len(sys.argv))',args=['x']*253); self.assertEqual(self.finish(j['job_id'])['stdout'],'254\n')
  def test_exact_payload_byte_limit(self):

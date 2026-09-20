@@ -8,6 +8,7 @@
 const std = @import("std");
 const environment = @import("environment.zig");
 const process = @import("process.zig");
+const resources = @import("resources.zig");
 const state = @import("state.zig");
 const walker = @import("walker.zig");
 const host_policy = @import("policy.zig");
@@ -68,6 +69,7 @@ pub const StartRequest = struct {
     stdin: ?[]const u8 = null,
     timeout_seconds: u32 = default_timeout_seconds,
     output_limit_bytes: usize = default_output_limit_bytes,
+    resources: resources.Values = .{},
     systemd_properties: []const []const u8 = &.{},
 };
 
@@ -93,6 +95,7 @@ pub const Meta = struct {
     created_at: i64,
     timeout_seconds: u32,
     output_limit_bytes: usize,
+    resources: resources.Values = .{},
     systemd_properties: []const []const u8 = &.{},
     stdout_truncated: ?bool,
     stderr_truncated: ?bool,
@@ -144,6 +147,7 @@ const Request = struct {
     has_stdin: bool,
     timeout_seconds: u32,
     output_limit_bytes: usize,
+    resources: resources.Values = .{},
     systemd_properties: []const []const u8 = &.{},
     created_at: i64,
 };
@@ -202,7 +206,7 @@ pub fn start(
 ) Error!Meta {
     try policy.validate();
     try validateStart(init.io, policy, request);
-    if (policy.job_backend == .walker) try walker.check(init.io, allocator, policy.walker.?);
+    if (policy.job_backend == .walker) try walker.check(init.io, allocator, policy.walker.?, request.resources);
     var id: [32]u8 = undefined;
     state.randomHex(init.io, &id);
     const job_id = allocator.dupe(u8, &id) catch return error.OutOfMemory;
@@ -232,6 +236,7 @@ pub fn start(
         .has_stdin = request.stdin != null,
         .timeout_seconds = request.timeout_seconds,
         .output_limit_bytes = request.output_limit_bytes,
+        .resources = request.resources,
         .systemd_properties = request.systemd_properties,
         .created_at = state.timestamp(init.io),
     };
@@ -259,6 +264,7 @@ pub fn start(
             input_path,
             request.timeout_seconds,
             request.output_limit_bytes,
+            request.resources,
             &env,
         ) catch |failure| {
             if (failure == error.WalkerSubmissionUncertain) {
@@ -765,10 +771,18 @@ fn validateStart(io: Io, policy: host_policy.Policy, request: StartRequest) Erro
     if (request.output_limit_bytes < min_output_limit_bytes or request.output_limit_bytes > max_output_limit_bytes) {
         return error.InvalidJob;
     }
-    if (policy.job_backend == .systemd_user) {
-        try validateSystemdProperties(request.systemd_properties);
-    } else if (request.systemd_properties.len != 0) {
-        return error.InvalidJob;
+    request.resources.validate() catch return error.InvalidJob;
+    switch (policy.job_backend) {
+        .systemd_user => {
+            if (!request.resources.isEmpty()) return error.InvalidJob;
+            try validateSystemdProperties(request.systemd_properties);
+        },
+        .walker => {
+            if (request.systemd_properties.len != 0) return error.InvalidJob;
+        },
+        .process => {
+            if (!request.resources.isEmpty() or request.systemd_properties.len != 0) return error.InvalidJob;
+        },
     }
     var directory = Io.Dir.cwd().openDir(io, request.cwd, .{}) catch return error.InvalidJob;
     directory.close(io);
@@ -786,6 +800,7 @@ fn validateStored(policy: host_policy.Policy, request: Request, expected_job_id:
                 return error.InvalidJob;
             if (!std.mem.eql(u8, unit, expected)) return error.InvalidJob;
             try validateSystemdProperties(request.systemd_properties);
+            if (!request.resources.isEmpty()) return error.InvalidJob;
         },
         .walker => {
             const ref = request.walker_ref orelse return error.InvalidJob;
@@ -797,10 +812,12 @@ fn validateStored(policy: host_policy.Policy, request: Request, expected_job_id:
             if (!walker.validConfig(ref.config) or !std.mem.eql(u8, ref.run_id, expected_job_id) or
                 !std.mem.startsWith(u8, ref.name, policy.job_unit_prefix) or
                 !std.mem.eql(u8, ref.name[policy.job_unit_prefix.len..], expected_job_id)) return error.InvalidJob;
+            request.resources.validate() catch return error.InvalidJob;
             if (request.unit != null or request.systemd_properties.len != 0) return error.InvalidJob;
         },
         .process => {
-            if (request.unit != null or request.systemd_properties.len != 0) return error.InvalidJob;
+            if (request.unit != null or !request.resources.isEmpty() or request.systemd_properties.len != 0)
+                return error.InvalidJob;
         },
     }
     try validateArgv(request.argv);
@@ -873,6 +890,20 @@ test "process backend rejects systemd-only resource properties" {
     }));
 }
 
+test "process and systemd backends reject portable Walker resource controls" {
+    const request = StartRequest{
+        .argv = &.{"true"},
+        .cwd = "/tmp",
+        .timeout_seconds = 1,
+        .output_limit_bytes = min_output_limit_bytes,
+        .resources = .{ .cpu_weight = 50 },
+    };
+    var policy = test_policy;
+    policy.job_backend = .process;
+    try std.testing.expectError(error.InvalidJob, validateStart(std.testing.io, policy, request));
+    try std.testing.expectError(error.InvalidJob, validateStart(std.testing.io, test_policy, request));
+}
+
 test "linux process identity binds pid to proc start time" {
     const pid: i32 = @intCast(std.os.linux.getpid());
     const start_time = try processStartTime(std.testing.io, pid);
@@ -906,6 +937,7 @@ test "legacy durable job metadata defaults to no systemd resource properties" {
     const parsed = try std.json.parseFromSlice(Request, std.testing.allocator, legacy, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 0), parsed.value.systemd_properties.len);
+    try std.testing.expect(parsed.value.resources.isEmpty());
 }
 
 test "durable job stdin admission matches the shared process bound" {
@@ -946,6 +978,7 @@ fn observe(io: Io, allocator: Allocator, job_dir: []const u8, request: Request) 
         .created_at = request.created_at,
         .timeout_seconds = request.timeout_seconds,
         .output_limit_bytes = request.output_limit_bytes,
+        .resources = request.resources,
         .systemd_properties = request.systemd_properties,
         .stdout_truncated = exists(io, job_dir, "stdout.truncated"),
         .stderr_truncated = exists(io, job_dir, "stderr.truncated"),
@@ -956,7 +989,8 @@ fn observe(io: Io, allocator: Allocator, job_dir: []const u8, request: Request) 
 
 fn walkerMeta(request: Request, observed: walker.Meta) Error!Meta {
     if (observed.timeout_ms.? != @as(u64, request.timeout_seconds) * 1000 or
-        observed.output_limit_bytes != request.output_limit_bytes) return error.WalkerInvalidResponse;
+        observed.output_limit_bytes != request.output_limit_bytes or
+        !std.meta.eql(observed.resources_requested, request.resources)) return error.WalkerInvalidResponse;
     var meta = startingMeta(request);
     meta.state = switch (observed.state) {
         .starting => .starting,
@@ -985,6 +1019,7 @@ fn startingMeta(request: Request) Meta {
         .created_at = request.created_at,
         .timeout_seconds = request.timeout_seconds,
         .output_limit_bytes = request.output_limit_bytes,
+        .resources = request.resources,
         .systemd_properties = request.systemd_properties,
         .stdout_truncated = false,
         .stderr_truncated = false,

@@ -19,6 +19,7 @@ class Contract(unittest.TestCase):
         ping=json.loads(subprocess.check_output([str(cls.walker),"ping"],env=dict(os.environ,WALKER_HOME=str(cls.home))))
         if ping.get("schema")!="walker/v5" or not ping.get("durable_workloads_v1") or ping.get("delegated_cgroup_v2_admission")!="ready":
             raise RuntimeError("Walker fixture is not v5 durable/ready")
+        cls.resource_controls=ping.get("resource_controls",{})
     def setUp(self):
         self.root = P(tempfile.mkdtemp(prefix="case-", dir=self.parent))
         self.home = self.__class__.home
@@ -189,6 +190,50 @@ class Contract(unittest.TestCase):
     def test_systemd_options_are_not_admitted(self):
         r=self.call("job_start",dict(argv=["/usr/bin/true"],cwd=str(self.root),systemd_properties=[]),ok=False)
         self.assertEqual(r["error"],"InvalidArguments")
+    def test_typed_resources_round_trip_through_walker(self):
+        if not all(self.resource_controls.get(key) for key in (
+            "memory_max_bytes","memory_pressure_bytes","swap_max_bytes","tasks_max",
+            "cpu_max_us_per_second","cpu_weight","io_weight",
+        )):
+            self.skipTest("fixture does not delegate all typed resource controllers")
+        requested=dict(
+            memory_max_bytes=512*1024*1024,
+            memory_pressure_bytes=256*1024*1024,
+            swap_max_bytes=512*1024*1024,
+            tasks_max=256,
+            cpu_max_us_per_second=1_000_000,
+            cpu_weight=77,
+            io_weight=88,
+        )
+        r=self.start("print('resources',flush=True)",resources=requested)
+        self.assertEqual(r["resources"],requested)
+        end=self.done(r["job_id"])
+        self.assertEqual(end["resources"],requested)
+        view=json.loads(subprocess.check_output([str(self.walker),"inspect",r["job_id"]],env=self.env))["animal"]
+        self.assertEqual(view["resources_requested"],requested)
+        effective=view["resources_effective"]
+        for key,value in requested.items():
+            self.assertEqual(effective[key],value,(key,effective))
+    def test_unavailable_requested_resource_rejects_before_local_binding(self):
+        shim=self.root/"missing-io-capability"
+        shim.write_text(f"""#!/usr/bin/python3
+import json,subprocess,sys
+r=subprocess.run([{str(self.walker)!r},*sys.argv[1:]],capture_output=True)
+if sys.argv[1]=="ping" and r.returncode==0:
+ d=json.loads(r.stdout); d["resource_controls_ready"]=False; d["resource_controls"]["io_weight"]=False
+ print(json.dumps(d)); sys.exit(0)
+sys.stdout.buffer.write(r.stdout); sys.stderr.buffer.write(r.stderr); sys.exit(r.returncode)
+""")
+        shim.chmod(0o700)
+        r=self.call(
+            "job_start",
+            dict(argv=["/usr/bin/true"],cwd=str(self.root),resources=dict(io_weight=50)),
+            ok=False,
+            walker=shim,
+        )
+        self.assertEqual(r["error"],"WalkerResourceUnavailable")
+        jobs=self.state/"jobs"
+        self.assertFalse(jobs.exists() and any(jobs.iterdir()))
     def test_lost_launch_ack_retains_id_and_does_not_replay(self):
         shim=self.root/"lost-ack"
         shim.write_text(f"""#!/usr/bin/python3

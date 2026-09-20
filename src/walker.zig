@@ -1,6 +1,7 @@
 //! Adapts the versioned Walker CLI. No socket protocol, process supervision, or backend fallback lives here.
 const std = @import("std");
 const process = @import("process.zig");
+const resources = @import("resources.zig");
 const state = @import("state.zig");
 const Io = std.Io;
 const A = std.mem.Allocator;
@@ -15,6 +16,7 @@ pub const Error = process.Error || state.Error || error{
     WalkerSubmissionUncertain,
     WalkerOwnershipUnavailable,
     WalkerHistoryFull,
+    WalkerResourceUnavailable,
     OffsetOutOfRange,
     JobNotFound,
 };
@@ -31,6 +33,7 @@ pub const Meta = struct {
     reconciled_at_ms: ?i64 = null,
     stdout_discarded_bytes: ?u64 = 0,
     stderr_discarded_bytes: ?u64 = 0,
+    resources_requested: resources.Values = .{},
 };
 pub const Slice = struct { encoding: []const u8, data: []const u8, next_offset: u64, eof: bool };
 pub const Logs = struct {
@@ -57,7 +60,7 @@ fn checkExecutable(io: Io, config: Config) Error!void {
 
 /// Durable-job admission proves the explicitly selected Walker is the current v5
 /// durable workload owner before any workstation-tools job state is created.
-pub fn check(io: Io, a: A, config: Config) Error!void {
+pub fn check(io: Io, a: A, config: Config, requested: resources.Values) Error!void {
     try checkExecutable(io, config);
     const bytes = try exchange(io, a, config, &.{"ping"}, null, false);
     const reply = std.json.parseFromSliceLeaky(struct {
@@ -69,6 +72,8 @@ pub fn check(io: Io, a: A, config: Config) Error!void {
         restart_reconciliation_v1: bool = false,
         restart_owner: []const u8 = "",
         durable_workloads_v1: bool = false,
+        resource_controls_ready: bool = false,
+        resource_controls: resources.Capabilities = .{},
     }, a, bytes, .{ .ignore_unknown_fields = true }) catch return error.WalkerInvalidResponse;
     if (!reply.ok) return error.WalkerInvalidResponse;
     if (!eql(reply.schema, "walker/v5") or reply.version != 5)
@@ -77,6 +82,8 @@ pub fn check(io: Io, a: A, config: Config) Error!void {
         !eql(reply.delegated_cgroup_v2_admission, "ready") or
         !reply.restart_reconciliation_v1 or !eql(reply.restart_owner, "platform"))
         return error.WalkerDurabilityUnavailable;
+    if (!requested.isEmpty() and (!reply.resource_controls_ready or !reply.resource_controls.supports(requested)))
+        return error.WalkerResourceUnavailable;
 }
 
 pub fn launch(
@@ -88,6 +95,7 @@ pub fn launch(
     stdin_path: ?[]const u8,
     timeout_seconds: u32,
     output_limit: usize,
+    requested: resources.Values,
     environment: *const std.process.Environ.Map,
 ) Error!void {
     var args: std.ArrayList([]const u8) = .empty;
@@ -107,6 +115,20 @@ pub fn launch(
         "--containment",
         "delegated_cgroup_v2",
     });
+    if (requested.memory_max_bytes) |value|
+        try args.appendSlice(a, &.{ "--memory-max-bytes", try std.fmt.allocPrint(a, "{d}", .{value}) });
+    if (requested.memory_pressure_bytes) |value|
+        try args.appendSlice(a, &.{ "--memory-pressure-bytes", try std.fmt.allocPrint(a, "{d}", .{value}) });
+    if (requested.swap_max_bytes) |value|
+        try args.appendSlice(a, &.{ "--swap-max-bytes", try std.fmt.allocPrint(a, "{d}", .{value}) });
+    if (requested.tasks_max) |value|
+        try args.appendSlice(a, &.{ "--tasks-max", try std.fmt.allocPrint(a, "{d}", .{value}) });
+    if (requested.cpu_max_us_per_second) |value|
+        try args.appendSlice(a, &.{ "--cpu-max-us-per-second", try std.fmt.allocPrint(a, "{d}", .{value}) });
+    if (requested.cpu_weight) |value|
+        try args.appendSlice(a, &.{ "--cpu-weight", try std.fmt.allocPrint(a, "{d}", .{value}) });
+    if (requested.io_weight) |value|
+        try args.appendSlice(a, &.{ "--io-weight", try std.fmt.allocPrint(a, "{d}", .{value}) });
     if (stdin_path) |path| try args.appendSlice(a, &.{ "--stdin-file", path });
     try args.append(a, "--");
     try args.appendSlice(a, argv);
@@ -206,7 +228,7 @@ fn exchange(
     @memcpy(argv[1..], args);
     // Wrapper options do not consume the already-validated payload's argv budget.
     var result = process.runWithBudget(a, io, argv, "/", null, .fromSeconds(15), &env, .{
-        .arguments = process.max_arguments + 20,
+        .arguments = process.max_arguments + 36,
         .bytes = process.max_argv_bytes + 4 * state.max_path_bytes + 1024,
     }) catch |failure| return if (mutation and failure != error.SpawnFailed)
         error.WalkerSubmissionUncertain

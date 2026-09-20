@@ -6,6 +6,7 @@ const std = @import("std");
 const jobs = @import("jobs.zig");
 const environment = @import("environment.zig");
 const process = @import("process.zig");
+const resources = @import("resources.zig");
 const state = @import("state.zig");
 const host_policy = @import("policy.zig");
 
@@ -38,6 +39,8 @@ pub const max_job_read_bytes = jobs.max_read_bytes;
 pub const JobState = jobs.JobState;
 /// Durable job cancellation reason shared with consumers that describe tool output schemas.
 pub const JobCancelReason = jobs.CancelReason;
+/// Portable typed resource request accepted by supporting durable-job backends.
+pub const JobResources = resources.Values;
 
 /// Maximum PNG/JPEG bytes admitted to one native MCP image result.
 pub const max_image_bytes: usize = 8 * 1024 * 1024;
@@ -153,6 +156,7 @@ pub fn description(tool: Tool) []const u8 {
 pub fn descriptionForPolicy(policy: Policy, tool: Tool) []const u8 {
     if (policy.job_backend == .walker) return switch (tool) {
         .job_start => "Start one bounded host workload through the explicitly configured Walker CLI. " ++
+            "Optional resources use the portable typed whole-workload controls advertised by this schema. " ++
             "The returned job ID is also its Walker run ID; no backend fallback is performed.",
         .job_read => "Read one Walker-owned durable workload and bounded incremental stdout/stderr slices.",
         .job_cancel => "Request stop of one Walker-owned workload. Read its terminal result to confirm completion.",
@@ -192,6 +196,7 @@ pub fn validateArguments(tool: Tool, arguments: std.json.ObjectMap) Error!void {
                 "stdin",
                 "timeout_seconds",
                 "output_limit_bytes",
+                "resources",
                 "systemd_properties",
             });
             try requiredArgvBounded(arguments, "argv");
@@ -203,6 +208,7 @@ pub fn validateArguments(tool: Tool, arguments: std.json.ObjectMap) Error!void {
             if (output_limit < jobs.min_output_limit_bytes or output_limit > jobs.max_output_limit_bytes) {
                 return error.InvalidArguments;
             }
+            _ = try optionalResources(arguments);
             try validateOptionalSystemdProperties(arguments);
         },
         .job_read => {
@@ -223,9 +229,12 @@ pub fn validateArguments(tool: Tool, arguments: std.json.ObjectMap) Error!void {
 /// Rejects backend-specific arguments that are not available on this embedding host.
 pub fn validateArgumentsForPolicy(policy: Policy, tool: Tool, arguments: std.json.ObjectMap) Error!void {
     try validateArguments(tool, arguments);
-    if (policy.job_backend != .systemd_user and tool == .job_start and arguments.contains("systemd_properties")) {
-        return error.InvalidArguments;
-    }
+    if (tool == .job_start) switch (policy.job_backend) {
+        .systemd_user => if (arguments.contains("resources")) return error.InvalidArguments,
+        .process => if (arguments.contains("resources") or arguments.contains("systemd_properties"))
+            return error.InvalidArguments,
+        .walker => if (arguments.contains("systemd_properties")) return error.InvalidArguments,
+    };
 }
 
 fn command(context: Context, arguments: std.json.ObjectMap) Error!std.json.Value {
@@ -353,6 +362,7 @@ fn jobStart(context: Context, arguments: std.json.ObjectMap) Error!std.json.Valu
         .stdin = try optionalString(arguments, "stdin"),
         .timeout_seconds = std.math.cast(u32, timeout) orelse return error.InvalidArguments,
         .output_limit_bytes = output_limit,
+        .resources = try optionalResources(arguments),
         .systemd_properties = try optionalSystemdProperties(context.allocator, arguments),
     });
     return metaValue(context.allocator, meta);
@@ -403,6 +413,8 @@ fn metaValue(allocator: Allocator, meta: jobs.Meta) Error!std.json.Value {
     try put(allocator, &output, "output_limit_bytes", .{ .integer = @intCast(meta.output_limit_bytes) });
     if (meta.unit != null) {
         try put(allocator, &output, "systemd_properties", try argvValue(allocator, meta.systemd_properties));
+    } else {
+        try put(allocator, &output, "resources", try resourcesValue(allocator, meta.resources));
     }
     try put(allocator, &output, "stdout_truncated", if (meta.stdout_truncated) |value| .{ .bool = value } else .null);
     try put(allocator, &output, "stderr_truncated", if (meta.stderr_truncated) |value| .{ .bool = value } else .null);
@@ -458,6 +470,49 @@ fn optionalSystemdProperties(allocator: Allocator, arguments: std.json.ObjectMap
     }
     jobs.validateSystemdProperties(result) catch return error.InvalidArguments;
     return result;
+}
+
+fn optionalResources(arguments: std.json.ObjectMap) Error!resources.Values {
+    const value = arguments.get("resources") orelse return .{};
+    if (value != .object) return error.InvalidArguments;
+    try onlyArguments(value.object, &.{
+        "memory_max_bytes",
+        "memory_pressure_bytes",
+        "swap_max_bytes",
+        "tasks_max",
+        "cpu_max_us_per_second",
+        "cpu_weight",
+        "io_weight",
+    });
+    const result = resources.Values{
+        .memory_max_bytes = try optionalUnsigned(u64, value.object, "memory_max_bytes"),
+        .memory_pressure_bytes = try optionalUnsigned(u64, value.object, "memory_pressure_bytes"),
+        .swap_max_bytes = try optionalUnsigned(u64, value.object, "swap_max_bytes"),
+        .tasks_max = try optionalUnsigned(u32, value.object, "tasks_max"),
+        .cpu_max_us_per_second = try optionalUnsigned(u32, value.object, "cpu_max_us_per_second"),
+        .cpu_weight = try optionalUnsigned(u16, value.object, "cpu_weight"),
+        .io_weight = try optionalUnsigned(u16, value.object, "io_weight"),
+    };
+    result.validate() catch return error.InvalidArguments;
+    return result;
+}
+
+fn optionalUnsigned(comptime T: type, values: std.json.ObjectMap, name: []const u8) Error!?T {
+    const value = values.get(name) orelse return null;
+    if (value != .integer or value.integer < 0) return error.InvalidArguments;
+    return std.math.cast(T, value.integer) orelse error.InvalidArguments;
+}
+
+fn resourcesValue(allocator: Allocator, value: resources.Values) Error!std.json.Value {
+    var output = object();
+    if (value.memory_max_bytes) |number| try put(allocator, &output, "memory_max_bytes", .{ .integer = @intCast(number) });
+    if (value.memory_pressure_bytes) |number| try put(allocator, &output, "memory_pressure_bytes", .{ .integer = @intCast(number) });
+    if (value.swap_max_bytes) |number| try put(allocator, &output, "swap_max_bytes", .{ .integer = @intCast(number) });
+    if (value.tasks_max) |number| try put(allocator, &output, "tasks_max", .{ .integer = @intCast(number) });
+    if (value.cpu_max_us_per_second) |number| try put(allocator, &output, "cpu_max_us_per_second", .{ .integer = @intCast(number) });
+    if (value.cpu_weight) |number| try put(allocator, &output, "cpu_weight", .{ .integer = @intCast(number) });
+    if (value.io_weight) |number| try put(allocator, &output, "io_weight", .{ .integer = @intCast(number) });
+    return .{ .object = output };
 }
 
 fn validateProcessOptions(arguments: std.json.ObjectMap) Error!void {
@@ -786,8 +841,50 @@ pub fn inputSchemaJson(tool: Tool) []const u8 {
 
 /// Returns the exact input schema after applying host-selected backend capabilities.
 pub fn inputSchemaJsonForPolicy(policy: Policy, tool: Tool) []const u8 {
-    if (policy.job_backend != .systemd_user and tool == .job_start) return processJobStartSchemaJson();
+    if (tool == .job_start) return switch (policy.job_backend) {
+        .systemd_user => inputSchemaJson(tool),
+        .process => processJobStartSchemaJson(),
+        .walker => walkerJobStartSchemaJson(),
+    };
     return inputSchemaJson(tool);
+}
+
+fn walkerJobStartSchemaJson() []const u8 {
+    return
+    \\{
+    \\  "type": "object",
+    \\  "properties": {
+    \\    "argv": {
+    \\      "type": "array", "minItems": 1, "maxItems": 256,
+    \\      "items": {"type": "string", "minLength": 1, "maxLength": 32768},
+    \\      "description": "Combined argv bytes must not exceed 32768."
+    \\    },
+    \\    "cwd": {
+    \\      "type": "string", "minLength": 1, "maxLength": 4096,
+    \\      "description": "Existing target directory. Start with '.'; do not infer /home/<node> from the node label."
+    \\    },
+    \\    "stdin": {"type": ["string", "null"], "maxLength": 131072},
+    \\    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 86400},
+    \\    "output_limit_bytes": {"type": "integer", "minimum": 4096, "maximum": 536870912},
+    \\    "resources": {
+    \\      "type": "object",
+    \\      "properties": {
+    \\        "memory_max_bytes": {"type": "integer", "minimum": 0, "maximum": 1152921504606846976},
+    \\        "memory_pressure_bytes": {"type": "integer", "minimum": 0, "maximum": 1152921504606846976},
+    \\        "swap_max_bytes": {"type": "integer", "minimum": 0, "maximum": 1152921504606846976},
+    \\        "tasks_max": {"type": "integer", "minimum": 1, "maximum": 4294967295},
+    \\        "cpu_max_us_per_second": {"type": "integer", "minimum": 10000, "maximum": 4294967295},
+    \\        "cpu_weight": {"type": "integer", "minimum": 1, "maximum": 10000},
+    \\        "io_weight": {"type": "integer", "minimum": 1, "maximum": 10000}
+    \\      },
+    \\      "additionalProperties": false,
+    \\      "description": "Optional typed controls. If both are present, memory_pressure_bytes must not exceed memory_max_bytes."
+    \\    }
+    \\  },
+    \\  "required": ["argv", "cwd"],
+    \\  "additionalProperties": false
+    \\}
+    ;
 }
 
 fn processJobStartSchemaJson() []const u8 {
@@ -964,13 +1061,26 @@ fn processJobMetaSchemaJson() []const u8 {
     \\    "created_at": {"type": "integer"},
     \\    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 86400},
     \\    "output_limit_bytes": {"type": "integer", "minimum": 4096, "maximum": 536870912},
+    \\    "resources": {
+    \\      "type": "object",
+    \\      "properties": {
+    \\        "memory_max_bytes": {"type": "integer", "minimum": 0, "maximum": 1152921504606846976},
+    \\        "memory_pressure_bytes": {"type": "integer", "minimum": 0, "maximum": 1152921504606846976},
+    \\        "swap_max_bytes": {"type": "integer", "minimum": 0, "maximum": 1152921504606846976},
+    \\        "tasks_max": {"type": "integer", "minimum": 1, "maximum": 4294967295},
+    \\        "cpu_max_us_per_second": {"type": "integer", "minimum": 10000, "maximum": 4294967295},
+    \\        "cpu_weight": {"type": "integer", "minimum": 1, "maximum": 10000},
+    \\        "io_weight": {"type": "integer", "minimum": 1, "maximum": 10000}
+    \\      },
+    \\      "additionalProperties": false
+    \\    },
     \\    "stdout_truncated": {"type": ["boolean", "null"]},
     \\    "stderr_truncated": {"type": ["boolean", "null"]},
     \\    "exit_code": {"type": "integer"},
     \\    "ended_at": {"type": "integer"}
     \\  },
     \\  "required": ["job_id", "state", "argv", "cwd", "created_at", "timeout_seconds",
-    \\    "output_limit_bytes", "stdout_truncated", "stderr_truncated"],
+    \\    "output_limit_bytes", "resources", "stdout_truncated", "stderr_truncated"],
     \\  "additionalProperties": false
     \\}
     ;
@@ -988,6 +1098,19 @@ fn processJobReadSchemaJson() []const u8 {
     \\    "created_at": {"type": "integer"},
     \\    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 86400},
     \\    "output_limit_bytes": {"type": "integer", "minimum": 4096, "maximum": 536870912},
+    \\    "resources": {
+    \\      "type": "object",
+    \\      "properties": {
+    \\        "memory_max_bytes": {"type": "integer", "minimum": 0, "maximum": 1152921504606846976},
+    \\        "memory_pressure_bytes": {"type": "integer", "minimum": 0, "maximum": 1152921504606846976},
+    \\        "swap_max_bytes": {"type": "integer", "minimum": 0, "maximum": 1152921504606846976},
+    \\        "tasks_max": {"type": "integer", "minimum": 1, "maximum": 4294967295},
+    \\        "cpu_max_us_per_second": {"type": "integer", "minimum": 10000, "maximum": 4294967295},
+    \\        "cpu_weight": {"type": "integer", "minimum": 1, "maximum": 10000},
+    \\        "io_weight": {"type": "integer", "minimum": 1, "maximum": 10000}
+    \\      },
+    \\      "additionalProperties": false
+    \\    },
     \\    "stdout_truncated": {"type": ["boolean", "null"]}, "stderr_truncated": {"type": ["boolean", "null"]},
     \\    "exit_code": {"type": "integer"}, "ended_at": {"type": "integer"},
     \\    "stdout": {"type": "string", "maxLength": 32768},
@@ -999,7 +1122,7 @@ fn processJobReadSchemaJson() []const u8 {
     \\    "stdout_eof": {"type": "boolean"}, "stderr_eof": {"type": "boolean"}
     \\  },
     \\  "required": ["job_id", "state", "argv", "cwd", "created_at", "timeout_seconds",
-    \\    "output_limit_bytes", "stdout_truncated", "stderr_truncated", "stdout", "stderr", "stdout_offset",
+    \\    "output_limit_bytes", "resources", "stdout_truncated", "stderr_truncated", "stdout", "stderr", "stdout_offset",
     \\    "stderr_offset", "next_stdout_offset", "next_stderr_offset", "stdout_eof", "stderr_eof"],
     \\  "additionalProperties": false
     \\}
@@ -1018,13 +1141,26 @@ fn processJobCancelSchemaJson() []const u8 {
     \\    "created_at": {"type": "integer"},
     \\    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 86400},
     \\    "output_limit_bytes": {"type": "integer", "minimum": 4096, "maximum": 536870912},
+    \\    "resources": {
+    \\      "type": "object",
+    \\      "properties": {
+    \\        "memory_max_bytes": {"type": "integer", "minimum": 0, "maximum": 1152921504606846976},
+    \\        "memory_pressure_bytes": {"type": "integer", "minimum": 0, "maximum": 1152921504606846976},
+    \\        "swap_max_bytes": {"type": "integer", "minimum": 0, "maximum": 1152921504606846976},
+    \\        "tasks_max": {"type": "integer", "minimum": 1, "maximum": 4294967295},
+    \\        "cpu_max_us_per_second": {"type": "integer", "minimum": 10000, "maximum": 4294967295},
+    \\        "cpu_weight": {"type": "integer", "minimum": 1, "maximum": 10000},
+    \\        "io_weight": {"type": "integer", "minimum": 1, "maximum": 10000}
+    \\      },
+    \\      "additionalProperties": false
+    \\    },
     \\    "stdout_truncated": {"type": ["boolean", "null"]}, "stderr_truncated": {"type": ["boolean", "null"]},
     \\    "exit_code": {"type": "integer"}, "ended_at": {"type": "integer"},
     \\    "cancelled": {"type": "boolean"},
     \\    "reason": {"enum": ["already_finished", "stop_requested"]}
     \\  },
     \\  "required": ["job_id", "state", "argv", "cwd", "created_at", "timeout_seconds",
-    \\    "output_limit_bytes", "stdout_truncated", "stderr_truncated", "cancelled", "reason"],
+    \\    "output_limit_bytes", "resources", "stdout_truncated", "stderr_truncated", "cancelled", "reason"],
     \\  "additionalProperties": false
     \\}
     ;
@@ -1044,8 +1180,10 @@ test "process job catalogue omits systemd-only controls and fields" {
     var policy = test_policy;
     policy.job_backend = .process;
     try std.testing.expect(std.mem.indexOf(u8, inputSchemaJsonForPolicy(policy, .job_start), "systemd") == null);
+    try std.testing.expect(std.mem.indexOf(u8, inputSchemaJsonForPolicy(policy, .job_start), "\"resources\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, outputSchemaJsonForPolicy(policy, .job_start), "unit") == null);
     try std.testing.expect(std.mem.indexOf(u8, outputSchemaJsonForPolicy(policy, .job_read), "systemd") == null);
+    try std.testing.expect(std.mem.indexOf(u8, outputSchemaJsonForPolicy(policy, .job_read), "\"resources\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, descriptionForPolicy(policy, .job_cancel), "systemd") == null);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1059,6 +1197,42 @@ test "process job catalogue omits systemd-only controls and fields" {
     var properties: std.json.Array = .init(allocator);
     try properties.append(.{ .string = "MemoryMax=1G" });
     try put(allocator, &args, "systemd_properties", .{ .array = properties });
+    try std.testing.expectError(error.InvalidArguments, validateArgumentsForPolicy(policy, .job_start, args));
+}
+
+test "walker job catalogue admits only portable typed resources" {
+    var policy = test_policy;
+    policy.job_backend = .walker;
+    policy.walker = .{ .executable = "/usr/bin/walker", .home = "/state/walker" };
+    const schema = inputSchemaJsonForPolicy(policy, .job_start);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "\"resources\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "cpu_weight") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "io_weight") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "systemd_properties") == null);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var args = object();
+    var argv: std.json.Array = .init(allocator);
+    try argv.append(.{ .string = "/usr/bin/true" });
+    try put(allocator, &args, "argv", .{ .array = argv });
+    try put(allocator, &args, "cwd", .{ .string = "/tmp" });
+    var controls = object();
+    try put(allocator, &controls, "memory_max_bytes", .{ .integer = 8192 });
+    try put(allocator, &controls, "memory_pressure_bytes", .{ .integer = 4096 });
+    try put(allocator, &controls, "cpu_weight", .{ .integer = 50 });
+    try put(allocator, &controls, "io_weight", .{ .integer = 75 });
+    try put(allocator, &args, "resources", .{ .object = controls });
+    try validateArgumentsForPolicy(policy, .job_start, args);
+
+    var process_policy = test_policy;
+    process_policy.job_backend = .process;
+    try std.testing.expectError(error.InvalidArguments, validateArgumentsForPolicy(process_policy, .job_start, args));
+    try std.testing.expectError(error.InvalidArguments, validateArgumentsForPolicy(test_policy, .job_start, args));
+
+    args.getPtr("resources").?.object.put(allocator, "memory_pressure_bytes", .{ .integer = 8193 }) catch
+        return error.OutOfMemory;
     try std.testing.expectError(error.InvalidArguments, validateArgumentsForPolicy(policy, .job_start, args));
 }
 
