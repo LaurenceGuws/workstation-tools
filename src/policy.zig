@@ -23,8 +23,8 @@ pub const Policy = struct {
     shell_prelude: []const u8 = "declare -xr HISTFILE=/dev/null;set +o history;",
     job_unit_prefix: []const u8,
     job_launch_argument: ?[]const u8 = null,
-    job_run_argument: []const u8,
-    job_finish_argument: []const u8,
+    job_run_argument: ?[]const u8 = null,
+    job_finish_argument: ?[]const u8 = null,
 
     /// Rejects policy bytes that cannot safely participate in environment names, argv, or systemd unit identity.
     pub fn validate(self: Policy) error{InvalidPolicy}!void {
@@ -32,13 +32,19 @@ pub const Policy = struct {
             !@import("walker.zig").validConfig(self.walker orelse return error.InvalidPolicy)) return error.InvalidPolicy;
         if (self.shell_prelude.len > max_shell_prelude_bytes) return error.InvalidPolicy;
         if (!validUnitPrefix(self.job_unit_prefix)) return error.InvalidPolicy;
-        if (self.job_backend == .process) {
-            if (!validRoleArgument(self.job_launch_argument orelse return error.InvalidPolicy)) return error.InvalidPolicy;
-        } else if (self.job_launch_argument) |argument| {
-            if (!validRoleArgument(argument)) return error.InvalidPolicy;
-        }
-        if (!validRoleArgument(self.job_run_argument) or !validRoleArgument(self.job_finish_argument)) {
-            return error.InvalidPolicy;
+        if (self.job_launch_argument) |argument| if (!validRoleArgument(argument)) return error.InvalidPolicy;
+        if (self.job_run_argument) |argument| if (!validRoleArgument(argument)) return error.InvalidPolicy;
+        if (self.job_finish_argument) |argument| if (!validRoleArgument(argument)) return error.InvalidPolicy;
+        switch (self.job_backend) {
+            .systemd_user => {
+                _ = self.job_run_argument orelse return error.InvalidPolicy;
+                _ = self.job_finish_argument orelse return error.InvalidPolicy;
+            },
+            .process => {
+                _ = self.job_launch_argument orelse return error.InvalidPolicy;
+                _ = self.job_run_argument orelse return error.InvalidPolicy;
+            },
+            .walker => {},
         }
         if (self.agent_marker) |marker| try validateMarker(marker);
         if (self.operator_marker) |marker| try validateMarker(marker);
@@ -85,4 +91,10 @@ test "host policy rejects unsafe markers and job identity bytes" {
     invalid.job_backend = .process;
     invalid.job_launch_argument = null;
     try std.testing.expectError(error.InvalidPolicy, invalid.validate());
+    invalid = valid;
+    invalid.job_backend = .walker;
+    invalid.walker = .{ .executable = "/selected/walker", .home = "/selected/state" };
+    invalid.job_run_argument = null;
+    invalid.job_finish_argument = null;
+    try invalid.validate();
 }

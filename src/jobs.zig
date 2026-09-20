@@ -303,7 +303,7 @@ fn launchSystemd(
     stored: Request,
 ) Error!void {
     const runtime = try std.fmt.allocPrint(allocator, "RuntimeMaxSec={d}s", .{stored.timeout_seconds});
-    const stop_post = try execStopPost(allocator, policy.job_finish_argument, executable, job_dir);
+    const stop_post = try execStopPost(allocator, policy.job_finish_argument.?, executable, job_dir);
     const unit_arg = try std.fmt.allocPrint(allocator, "--unit={s}", .{stored.unit.?});
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
@@ -323,7 +323,7 @@ fn launchSystemd(
         argv.append(allocator, "--property") catch return error.OutOfMemory;
         argv.append(allocator, property) catch return error.OutOfMemory;
     }
-    argv.appendSlice(allocator, &.{ "--", executable, policy.job_run_argument, job_dir }) catch return error.OutOfMemory;
+    argv.appendSlice(allocator, &.{ "--", executable, policy.job_run_argument.?, job_dir }) catch return error.OutOfMemory;
     var result = try process.run(init.gpa, init.io, argv.items, "/", null, .fromSeconds(10), null);
     defer result.deinit(init.gpa);
     if (result.timed_out or result.term == null or exitCode(result.term.?) != 0) return error.JobLaunchFailed;
@@ -455,7 +455,7 @@ pub fn launch(init: std.process.Init, policy: host_policy.Policy, job_dir: []con
     try validateExecution(init.io, stored);
     const executable = std.process.executablePathAlloc(init.io, allocator) catch return error.JobLaunchFailed;
     var supervisor = std.process.spawn(init.io, .{
-        .argv = &.{ executable, policy.job_run_argument, job_dir },
+        .argv = &.{ executable, policy.job_run_argument.?, job_dir },
         .cwd = .{ .path = "/" },
         .stdin = .ignore,
         .stdout = .ignore,
