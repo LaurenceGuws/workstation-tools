@@ -5,11 +5,9 @@ const environment = @import("environment.zig");
 
 pub const max_shell_prelude_bytes: usize = 62;
 pub const max_job_name_prefix_bytes: usize = 32;
-pub const EnvironmentSource = environment.Source;
 pub const WalkerConfig = @import("walker.zig").Config;
 
 pub const Policy = struct {
-    environment_source: EnvironmentSource = .user_manager,
     walker: WalkerConfig,
     agent_marker: ?environment.Marker = null,
     operator_marker: ?environment.Marker = null,

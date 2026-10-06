@@ -1,5 +1,5 @@
-//! Portable durable-workload resource requests. Backends must either enforce an
-//! admitted semantic exactly according to their contract or reject it.
+//! Portable resource requests for Walker-owned durable workloads.
+//! Walker must enforce an admitted semantic exactly or reject it.
 const std = @import("std");
 
 pub const max_memory_bytes: u64 = 1 << 60;

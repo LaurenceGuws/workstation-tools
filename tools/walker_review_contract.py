@@ -23,7 +23,7 @@ class AdapterReview(unittest.TestCase):
   cls.resource_controls=ping.get('resource_controls',{})
  def setUp(self):
   self.root=Path(tempfile.mkdtemp(prefix='rv-',dir=WS)); self.state=self.root/'tools'; self.whome=self.__class__.whome
-  self.env=dict(os.environ,HOME=str(self.root),TEST_STATE=str(self.state),TEST_BACKEND='walker',WALKER_BINARY=str(self.walker),WALKER_HOME=str(self.whome),PATH='/usr/bin:/bin',REVIEW_ENV='caller-owned')
+  self.env=dict(os.environ,HOME=str(self.root),TEST_STATE=str(self.state),WALKER_BINARY=str(self.walker),WALKER_HOME=str(self.whome),PATH='/usr/bin:/bin',REVIEW_ENV='caller-owned')
   self.calls=0
   self.run_ids=[]
  def tearDown(self):
@@ -113,16 +113,15 @@ class AdapterReview(unittest.TestCase):
   r=self.finish(j['job_id']); self.assertEqual(r['exit_code'],7); self.assertEqual(r['stdout'],'caller-owned\n'); self.assertEqual(r['stderr'],'ERR\n')
   meta=self.walker_cli('inspect',j['job_id'])['animal']; self.assertEqual(meta['run_id'],j['job_id']); self.assertEqual(meta['state'],'exited')
   self.assertEqual(r['ended_at'],meta['terminalized_at_ms']//1000); self.assertIsNone(meta['reconciled_at_ms'])
-  self.assertIsNone(r.get('unit')); self.assertNotIn('systemd_properties',r)
  def test_new_environment_reaches_existing_walker(self):
   keep=self.job('import time;time.sleep(10)')
   second=self.job('import os;print(os.environ["REVIEW_ENV"])',env=dict(self.env,REVIEW_ENV='second-shell'))
   self.assertEqual(self.finish(second['job_id'])['stdout'],'second-shell\n')
   a=self.walker_cli('inspect',keep['job_id'])['animal']; b=self.walker_cli('inspect',second['job_id'])['animal']
   self.assertEqual(a['walker_pid'],b['walker_pid']); self.tool('job_cancel',dict(job_id=keep['job_id'])); self.finish(keep['job_id'])
- def test_missing_walker_cannot_start_legacy_job(self):
+ def test_missing_walker_cannot_start_job(self):
   r=self.tool('job_start',dict(argv=['/usr/bin/true'],cwd=str(self.root)),success=False,env=dict(self.env,WALKER_BINARY=str(self.root/'missing')))
-  self.assertIn('Walker',r['error']); self.assertFalse((self.state/'jobs').exists())
+  self.assertIn('Walker',r['error']); self.assertFalse(self.state.exists())
  def test_nondurable_walker_rejected_before_state(self):
   other=self.root/'nondurable-home'; other_env=dict(self.env,WALKER_HOME=str(other))
   direct=json.loads(subprocess.check_output([
@@ -133,12 +132,12 @@ class AdapterReview(unittest.TestCase):
    self.assertFalse(ping['durable_workloads_v1'])
    r=self.tool('job_start',dict(argv=['/usr/bin/true'],cwd=str(self.root)),success=False,env=other_env)
    self.assertEqual(r['error'],'WalkerDurabilityUnavailable')
-   self.assertFalse((self.state/'jobs').exists())
+   self.assertFalse(self.state.exists())
   finally:
    subprocess.run([str(self.walker),'stop',direct['run_id']],env=other_env,capture_output=True)
- def test_systemd_properties_rejected_before_launch(self):
-  self.tool('job_start',dict(argv=['/usr/bin/true'],cwd=str(self.root),systemd_properties=['MemoryMax=1G']),success=False)
-  self.assertFalse((self.state/'jobs').exists())
+ def test_unknown_job_option_rejected_before_launch(self):
+  self.tool('job_start',dict(argv=['/usr/bin/true'],cwd=str(self.root),unexpected_option=['x']),success=False)
+  self.assertFalse(self.state.exists())
  def test_portable_resources_are_exact_walker_requests(self):
   if not all(self.resource_controls.get(key) for key in ('memory_max_bytes','memory_pressure_bytes','swap_max_bytes','tasks_max','cpu_max_us_per_second','cpu_weight','io_weight')):
    self.skipTest('fixture does not delegate all typed resource controllers')
@@ -167,7 +166,7 @@ class AdapterReview(unittest.TestCase):
   r=self.read(j['job_id'],max_bytes=3); self.assertIsInstance(r['stdout'],str); self.assertIsInstance(r['stderr'],str); self.assertGreater(r['next_stdout_offset'],0)
  def test_stdin_exact_bound_and_cleanup(self):
   j=self.tool('job_start',dict(argv=[sys.executable,'-c','import sys;print(len(sys.stdin.buffer.read()))'],cwd=str(self.root),stdin='x'*131072))
-  self.assertEqual(self.finish(j['job_id'])['stdout'],'131072\n'); self.assertFalse((self.state/'jobs'/j['job_id']/'stdin').exists()); self.assertFalse((self.whome/'runs'/j['job_id']/'stdin').exists())
+  self.assertEqual(self.finish(j['job_id'])['stdout'],'131072\n'); inputs=self.state/'workstation-inputs'; self.assertFalse(inputs.exists() and any(inputs.iterdir())); self.assertFalse((self.whome/'runs'/j['job_id']/'stdin').exists())
   self.tool('job_start',dict(argv=['/usr/bin/true'],cwd=str(self.root),stdin='x'*131073),success=False)
  def test_prefix_retention_keeps_draining(self):
   j=self.job('import os;os.write(1,b"x"*90000);os.write(2,b"y"*90000)',options=dict(output_limit_bytes=4096)); r=self.finish(j['job_id'])
@@ -183,33 +182,28 @@ class AdapterReview(unittest.TestCase):
   j=self.job(f'open({str(mark)!r},"a").write("one\\n")',env=dict(self.env,WALKER_BINARY=str(wrapper)))
   self.assertEqual(j['state'],'indeterminate'); self.assertRegex(j['job_id'],r'^[0-9a-f]{32}$'); time.sleep(.15); self.assertEqual(mark.read_text(),'one\n')
   self.assertEqual(self.walker_cli('inspect',j['job_id'])['animal']['state'],'exited')
- def test_known_not_run_failure_removes_local_binding(self):
+ def test_known_not_run_failure_creates_no_consumer_state(self):
   wrapper=self.wrapper('known-reject')
   r=self.tool('job_start',dict(argv=['/usr/bin/true'],cwd=str(self.root)),success=False,env=dict(self.env,WALKER_BINARY=str(wrapper)))
   self.assertEqual(r['error'],'WalkerDurabilityUnavailable')
-  jobs=self.state/'jobs'; self.assertFalse(jobs.exists() and any(jobs.iterdir()))
+  self.assertFalse(self.state.exists())
  def test_unversioned_mutation_error_is_uncertain_not_authority(self):
   wrapper=self.wrapper('unversioned-reject'); mark=self.root/'must-not-run'
   j=self.job(f'open({str(mark)!r},"w").write("bad")',env=dict(self.env,WALKER_BINARY=str(wrapper)))
   self.assertEqual(j['state'],'indeterminate')
-  self.assertTrue((self.state/'jobs'/j['job_id']/'request.json').is_file())
+  self.assertFalse(self.state.exists())
   self.assertFalse(mark.exists())
  def test_valid_old_ping_is_nondurable(self):
   wrapper=self.wrapper('old-ping')
   r=self.tool('job_start',dict(argv=['/usr/bin/true'],cwd=str(self.root)),success=False,env=dict(self.env,WALKER_BINARY=str(wrapper)))
   self.assertEqual(r['error'],'WalkerDurabilityUnavailable')
-  jobs=self.state/'jobs'; self.assertFalse(jobs.exists() and any(jobs.iterdir()))
+  self.assertFalse(self.state.exists())
  def test_acknowledged_start_does_not_depend_on_followup_inspection(self):
   j=self.job('print("started")',env=dict(self.env,WALKER_BINARY=str(self.wrapper('lost-inspect'))))
   self.assertEqual(j['state'],'starting'); self.assertRegex(j['job_id'],r'^[0-9a-f]{32}$'); self.assertFalse((self.root/'once').exists())
- def test_saved_binding_cannot_override_new_configuration(self):
+ def test_current_walker_selection_owns_observation(self):
   j=self.job('print("complete")'); self.finish(j['job_id'])
   self.tool('job_read',dict(job_id=j['job_id']),success=False,env=dict(self.env,WALKER_BINARY=str(self.root/'missing-new-walker')))
- def test_metadata_cannot_select_an_executable_for_read(self):
-  j=self.job('print("complete")'); self.finish(j['job_id']); marker=self.root/'executed'; rogue=self.root/'unselected'
-  rogue.write_text('#!'+sys.executable+'\nfrom pathlib import Path\nPath('+repr(str(marker))+').write_text("unsafe")\n'); rogue.chmod(0o700)
-  path=self.state/'jobs'/j['job_id']/'request.json'; data=json.loads(path.read_text()); data['walker_ref']['config']['executable']=str(rogue); path.write_text(json.dumps(data))
-  self.tool('job_read',dict(job_id=j['job_id']),success=False); self.assertFalse(marker.exists(),'metadata selected executable authority')
  def test_binary_short_command_stays_json_string(self):
   r=self.tool('command',dict(argv=[sys.executable,'-c','import os;os.write(1,bytes([255,0]));os.write(2,bytes([254]))'],cwd=str(self.root)))
   self.assertIsInstance(r['stdout'],str); self.assertIsInstance(r['stderr'],str)
@@ -217,7 +211,7 @@ class AdapterReview(unittest.TestCase):
   j=self.job('import time;print("first",flush=True);time.sleep(10)')
   time.sleep(.05); r=self.read(j['job_id']); self.assertFalse(r['stdout_eof']); self.assertFalse(r['stderr_eof'])
   self.tool('job_cancel',dict(job_id=j['job_id'])); self.finish(j['job_id'])
- def test_namespace_change_does_not_follow_stored_namespace(self):
+ def test_current_walker_namespace_owns_observation(self):
   j=self.job('print("complete")'); self.finish(j['job_id'])
   self.tool('job_read',dict(job_id=j['job_id']),success=False,env=dict(self.env,WALKER_HOME=str(self.root/'new-namespace')))
  def test_crashed_platform_owner_reconciles_without_stale_pid_control(self):

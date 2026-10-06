@@ -1,14 +1,14 @@
-//! Adapts the versioned Walker CLI. No socket protocol, process supervision, or backend fallback lives here.
+//! Adapts the versioned Walker CLI without importing Walker implementation or supervision policy.
 const std = @import("std");
 const process = @import("process.zig");
 const resources = @import("resources.zig");
-const state = @import("state.zig");
+const support = @import("support.zig");
 const Io = std.Io;
 const A = std.mem.Allocator;
 
 pub const Config = struct { executable: []const u8, home: []const u8 };
 pub const Ref = struct { config: Config, run_id: []const u8, name: []const u8 };
-pub const Error = process.Error || state.Error || error{
+pub const Error = process.Error || support.Error || error{
     WalkerUnavailable,
     WalkerDurabilityUnavailable,
     WalkerInvalidResponse,
@@ -25,7 +25,10 @@ pub const Meta = struct {
     schema: []const u8,
     run_id: []const u8,
     name: []const u8,
+    argv: []const []const u8,
+    cwd: []const u8,
     state: State,
+    created_at_ms: i64,
     timeout_ms: ?u32,
     output_limit_bytes: u32,
     exit_code: ?i32 = null,
@@ -47,7 +50,7 @@ pub const Logs = struct {
 
 pub fn validConfig(config: Config) bool {
     for ([_][]const u8{ config.executable, config.home }) |path| {
-        if (!std.fs.path.isAbsolute(path) or path.len > state.max_path_bytes or
+        if (!std.fs.path.isAbsolute(path) or path.len > support.max_path_bytes or
             std.mem.indexOfScalar(u8, path, 0) != null) return false;
     }
     return true;
@@ -191,11 +194,29 @@ pub fn stop(io: Io, a: A, ref: Ref) Error!bool {
 }
 
 fn validateMeta(meta: Meta, ref: Ref) Error!void {
-    if (!eql(meta.schema, "walker.run/v5") or !eql(meta.run_id, ref.run_id) or !eql(meta.name, ref.name) or
-        meta.output_limit_bytes < 4096 or meta.output_limit_bytes > 512 * 1024 * 1024)
+    if (!eql(meta.schema, "walker.run/v5") or
+        !eql(meta.run_id, ref.run_id) or
+        !eql(meta.name, ref.name) or
+        meta.argv.len == 0 or
+        meta.argv.len > process.max_arguments or
+        !validPath(meta.cwd) or
+        meta.created_at_ms <= 0 or
+        meta.output_limit_bytes < 4096 or
+        meta.output_limit_bytes > 512 * 1024 * 1024)
+    {
         return error.WalkerInvalidResponse;
+    }
+    var argv_bytes: usize = 0;
+    for (meta.argv) |argument| {
+        if (argument.len == 0) return error.WalkerInvalidResponse;
+        argv_bytes = std.math.add(usize, argv_bytes, argument.len) catch
+            return error.WalkerInvalidResponse;
+        if (argv_bytes > process.max_argv_bytes)
+            return error.WalkerInvalidResponse;
+    }
     const timeout = meta.timeout_ms orelse return error.WalkerInvalidResponse;
-    if (timeout == 0 or timeout > 86400000) return error.WalkerInvalidResponse;
+    if (timeout == 0 or timeout > 86400000 or timeout % 1000 != 0)
+        return error.WalkerInvalidResponse;
 }
 fn decode(a: A, stream: Slice, offset: usize, limit: usize) Error![]const u8 {
     const data = if (eql(stream.encoding, "utf8")) stream.data else if (eql(stream.encoding, "base64")) blk: {
@@ -229,7 +250,7 @@ fn exchange(
     // Wrapper options do not consume the already-validated payload's argv budget.
     var result = process.runWithBudget(a, io, argv, "/", null, .fromSeconds(15), &env, .{
         .arguments = process.max_arguments + 36,
-        .bytes = process.max_argv_bytes + 4 * state.max_path_bytes + 1024,
+        .bytes = process.max_argv_bytes + 4 * support.max_path_bytes + 1024,
     }) catch |failure| return if (mutation and failure != error.SpawnFailed)
         error.WalkerSubmissionUncertain
     else
@@ -340,16 +361,75 @@ pub const WorkloadLogs = struct {
     log_retention: Retention,
     streams_complete: bool,
 };
+pub const ResourceCpu = struct {
+    running_ns: ?u64 = null,
+    user_ns: ?u64 = null,
+    system_ns: ?u64 = null,
+    runnable_wait_ns: ?u64 = null,
+    throttled_ns: ?u64 = null,
+    periods: ?u64 = null,
+    throttled_periods: ?u64 = null,
+};
+
+pub const ResourceMemory = struct {
+    rss_bytes: ?u64 = null,
+    virtual_bytes: ?u64 = null,
+    rss_is_approximate: ?bool = null,
+    shared_pages_may_be_counted_twice: ?bool = null,
+    charged_bytes: ?u64 = null,
+    peak_charged_bytes: ?u64 = null,
+    swap_charged_bytes: ?u64 = null,
+    peak_swap_charged_bytes: ?u64 = null,
+    anon_charged_bytes: ?u64 = null,
+    file_charged_bytes: ?u64 = null,
+    kernel_charged_bytes: ?u64 = null,
+};
+
+pub const ResourceIo = struct {
+    read_bytes: ?u64 = null,
+    write_bytes: ?u64 = null,
+    read_operations: ?u64 = null,
+    write_operations: ?u64 = null,
+};
+
+pub const ResourceEvents = struct {
+    memory_low: ?u64 = null,
+    memory_high: ?u64 = null,
+    memory_max: ?u64 = null,
+    memory_oom: ?u64 = null,
+    memory_oom_kill: ?u64 = null,
+    memory_oom_group_kill: ?u64 = null,
+    tasks_max: ?u64 = null,
+};
+
+pub const ResourcePressure = struct {
+    cpu_some_ns: ?u64 = null,
+    cpu_full_ns: ?u64 = null,
+    memory_some_ns: ?u64 = null,
+    memory_full_ns: ?u64 = null,
+    io_some_ns: ?u64 = null,
+    io_full_ns: ?u64 = null,
+};
+
 pub const Resources = struct {
     scope: []const u8,
     cumulative_for_run: bool,
     atomic_snapshot: bool,
     partial: bool,
-    processes: u32,
-    threads: u64,
-    cpu: struct { running_ns: ?u64, runnable_wait_ns: ?u64 },
-    memory: struct { rss_bytes: u64, virtual_bytes: u64, shared_pages_may_be_counted_twice: bool },
+    processes: ?u64 = null,
+    total_processes: ?u64 = null,
+    limit_terminated_processes: ?u64 = null,
+    threads: ?u64 = null,
+    sampled_threads: ?u64 = null,
+    tasks: ?u64 = null,
+    peak_tasks: ?u64 = null,
+    cpu: ResourceCpu = .{},
+    memory: ResourceMemory = .{},
+    io: ResourceIo = .{},
+    events: ResourceEvents = .{},
+    pressure: ResourcePressure = .{},
 };
+
 pub const WorkloadStats = struct {
     run_id: []const u8,
     name: []const u8,
@@ -359,7 +439,7 @@ pub const WorkloadStats = struct {
 };
 
 /// One bounded CLI invocation, not one invocation per row. An unavailable Walker
-/// is an error, never an empty successful inventory or a different backend.
+/// is an error, never an empty successful inventory.
 pub fn inventory(io: Io, a: A, config: Config) Error![]WorkloadSummary {
     const bytes = try exchange(io, a, config, &.{"ps"}, null, false);
     const reply = std.json.parseFromSliceLeaky(struct {
@@ -441,8 +521,61 @@ pub fn workloadStats(io: Io, a: A, ref: Ref) Error!WorkloadStats {
     }, a, bytes, .{ .ignore_unknown_fields = true }) catch return error.WalkerInvalidResponse;
     if (!reply.ok or !eql(reply.schema, "walker/v5") or reply.animals.len != 1) return error.WalkerInvalidResponse;
     const row = reply.animals[0];
-    if (!eql(row.run_id, ref.run_id) or !eql(row.name, ref.name)) return error.WalkerInvalidResponse;
+    if (!eql(row.run_id, ref.run_id) or !eql(row.name, ref.name))
+        return error.WalkerInvalidResponse;
+    if (row.resources) |usage| try validateResourceUsage(usage);
     return row;
+}
+
+fn validateResourceUsage(usage: Resources) Error!void {
+    if (eql(usage.scope, "delegated_cgroup_v2")) {
+        if (!usage.cumulative_for_run or usage.atomic_snapshot or
+            usage.processes != null or usage.total_processes != null or
+            usage.limit_terminated_processes != null or
+            usage.threads != null or usage.sampled_threads != null or
+            usage.memory.rss_bytes != null or
+            usage.memory.virtual_bytes != null or
+            usage.memory.rss_is_approximate != null or
+            usage.memory.shared_pages_may_be_counted_twice != null or
+            usage.cpu.runnable_wait_ns != null)
+        {
+            return error.WalkerInvalidResponse;
+        }
+        if (usage.tasks) |current| {
+            if (usage.peak_tasks) |peak|
+                if (current > peak) return error.WalkerInvalidResponse;
+        }
+        if (usage.memory.charged_bytes) |current| {
+            if (usage.memory.peak_charged_bytes) |peak|
+                if (current > peak) return error.WalkerInvalidResponse;
+        }
+        if (usage.memory.swap_charged_bytes) |current| {
+            if (usage.memory.peak_swap_charged_bytes) |peak|
+                if (current > peak) return error.WalkerInvalidResponse;
+        }
+        return;
+    }
+    if (eql(usage.scope, "currently_visible_process_group_members")) {
+        if (usage.cumulative_for_run or
+            usage.tasks != null or usage.peak_tasks != null or
+            usage.cpu.user_ns != null or usage.cpu.system_ns != null or
+            usage.cpu.throttled_ns != null or usage.cpu.periods != null or
+            usage.cpu.throttled_periods != null or
+            usage.memory.charged_bytes != null or
+            usage.memory.peak_charged_bytes != null or
+            usage.memory.swap_charged_bytes != null or
+            usage.memory.peak_swap_charged_bytes != null or
+            usage.memory.anon_charged_bytes != null or
+            usage.memory.file_charged_bytes != null or
+            usage.memory.kernel_charged_bytes != null or
+            usage.io.read_operations != null or
+            usage.io.write_operations != null)
+        {
+            return error.WalkerInvalidResponse;
+        }
+        return;
+    }
+    return error.WalkerInvalidResponse;
 }
 
 fn decodeWindow(a: A, slice: WindowSlice, requested: ?u64, limit: usize) Error![]const u8 {
@@ -472,7 +605,7 @@ fn validName(name: []const u8) bool {
     return true;
 }
 fn validPath(path: []const u8) bool {
-    return std.fs.path.isAbsolute(path) and path.len <= state.max_path_bytes and std.mem.indexOfScalar(u8, path, 0) == null;
+    return std.fs.path.isAbsolute(path) and path.len <= support.max_path_bytes and std.mem.indexOfScalar(u8, path, 0) == null;
 }
 
 test "recent stream gaps are exact and cannot silently renumber data" {

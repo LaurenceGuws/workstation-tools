@@ -1,7 +1,7 @@
 //! Owns bounded local short-process execution and process-group cleanup.
 //!
-//! Short commands borrow their invocation and return owned bounded streams. Explicit backends own durable-job lifetime;
-//! durable job receipts live in `jobs.zig`, and MCP/tool naming lives above this module.
+//! Short commands borrow their invocation and return owned bounded streams.
+//! Walker owns durable-job lifetime; model/tool naming lives above this module.
 
 const builtin = @import("builtin");
 const std = @import("std");

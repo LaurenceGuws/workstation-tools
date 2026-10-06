@@ -1,6 +1,6 @@
 //! Owns bounded workstation operations that can be embedded independently of transport, session identity, and UI.
 //!
-//! Calls use request-lifetime allocation, direct process execution, durable job files, and bounded image I/O.
+//! Calls use request-lifetime allocation, direct process execution, Walker-owned durable jobs, and bounded image I/O.
 
 const builtin = @import("builtin");
 const std = @import("std");
@@ -8,7 +8,7 @@ const jobs = @import("jobs.zig");
 const environment = @import("environment.zig");
 const process = @import("process.zig");
 const resources = @import("resources.zig");
-const state = @import("state.zig");
+const support = @import("support.zig");
 const host_policy = @import("policy.zig");
 
 const Allocator = std.mem.Allocator;
@@ -36,7 +36,7 @@ pub const max_job_read_bytes = jobs.max_read_bytes;
 pub const JobState = jobs.JobState;
 /// Durable job cancellation reason shared with consumers that describe tool output schemas.
 pub const JobCancelReason = jobs.CancelReason;
-/// Portable typed resource request accepted by supporting durable-job backends.
+/// Portable typed resource request admitted for Walker-owned durable jobs.
 pub const JobResources = resources.Values;
 
 /// Maximum PNG/JPEG bytes admitted to one native MCP image result.
@@ -57,7 +57,6 @@ pub const max_shell_command_bytes: usize =
 
 /// Host execution policy supplied by the embedding application or transport.
 pub const Policy = host_policy.Policy;
-pub const EnvironmentSource = host_policy.EnvironmentSource;
 pub const WalkerConfig = host_policy.WalkerConfig;
 /// Typed CLI observation for operator clients; this does not add model-facing tools.
 pub const Walker = @import("walker.zig");
@@ -88,7 +87,7 @@ pub fn parse(name: []const u8) ?Tool {
 }
 
 /// Closed failures from workstation tool validation and execution.
-pub const Error = state.Error || process.Error || jobs.Error || environment.Error || error{
+pub const Error = support.Error || process.Error || jobs.Error || environment.Error || error{
     InvalidArguments,
     WorkingDirectoryUnavailable,
     FileNotFound,
@@ -103,7 +102,7 @@ pub const Context = struct {
     init: std.process.Init,
     policy: Policy,
     allocator: Allocator,
-    state_dir: []const u8,
+    scratch_dir: []const u8,
     root: []const u8,
 };
 
@@ -142,8 +141,8 @@ pub fn description(tool: Tool) []const u8 {
         .image_read => "Read one bounded, byte-validated PNG or JPEG as native image content.",
         .job_start => "Start one bounded host workload through the explicitly configured Walker CLI. " ++
             "Optional resources use portable typed whole-workload controls; the returned job ID is also its Walker run ID.",
-        .job_read => "Read one Walker-owned durable workload or retained legacy terminal evidence and bounded stdout/stderr slices.",
-        .job_cancel => "Request stop of one Walker-owned workload. Retained legacy jobs are observation-only.",
+        .job_read => "Read one Walker-owned durable workload and bounded stdout/stderr slices.",
+        .job_cancel => "Request stop of one Walker-owned durable workload.",
     };
 }
 
@@ -221,7 +220,7 @@ fn runProcess(
     argv: []const []const u8,
     operator_login: bool,
 ) Error!std.json.Value {
-    const cwd = try state.resolvePath(context.allocator, context.root, try requiredString(arguments, "cwd"));
+    const cwd = try support.resolvePath(context.allocator, context.root, try requiredString(arguments, "cwd"));
     try requireWorkingDirectory(context.init.io, cwd);
     const timeout_seconds = try optionalPositiveInt(arguments, "timeout_seconds", default_process_timeout_seconds);
     if (timeout_seconds > max_process_timeout_seconds) return error.InvalidArguments;
@@ -230,7 +229,6 @@ fn runProcess(
     var child_env = try environment.current(
         context.init,
         context.init.gpa,
-        context.policy.environment_source,
         context.policy.operator_marker,
     );
     defer child_env.deinit();
@@ -278,7 +276,7 @@ fn runProcess(
 }
 
 fn imageRead(context: Context, arguments: std.json.ObjectMap) Error!std.json.Value {
-    const path = try state.resolvePath(context.allocator, context.root, try requiredString(arguments, "path"));
+    const path = try support.resolvePath(context.allocator, context.root, try requiredString(arguments, "path"));
     const mime = if (std.mem.endsWith(u8, path, ".png"))
         "image/png"
     else if (std.mem.endsWith(u8, path, ".jpg") or std.mem.endsWith(u8, path, ".jpeg"))
@@ -309,17 +307,17 @@ fn imageRead(context: Context, arguments: std.json.ObjectMap) Error!std.json.Val
         context.allocator,
         &output,
         "sha256",
-        .{ .string = try dupe(context.allocator, state.hashHex(bytes, &hash_buffer)) },
+        .{ .string = try dupe(context.allocator, support.hashHex(bytes, &hash_buffer)) },
     );
     return .{ .object = output };
 }
 
 fn jobStart(context: Context, arguments: std.json.ObjectMap) Error!std.json.Value {
-    const cwd = try state.resolvePath(context.allocator, context.root, try requiredString(arguments, "cwd"));
+    const cwd = try support.resolvePath(context.allocator, context.root, try requiredString(arguments, "cwd"));
     try requireWorkingDirectory(context.init.io, cwd);
     const timeout = try optionalPositiveInt(arguments, "timeout_seconds", jobs.default_timeout_seconds);
     const output_limit = try optionalPositiveInt(arguments, "output_limit_bytes", jobs.default_output_limit_bytes);
-    const meta = try jobs.start(context.init, context.allocator, context.policy, context.state_dir, .{
+    const meta = try jobs.start(context.init, context.allocator, context.policy, context.scratch_dir, .{
         .argv = try requiredArgv(context.allocator, arguments, "argv"),
         .cwd = cwd,
         .stdin = try optionalString(arguments, "stdin"),
@@ -331,7 +329,7 @@ fn jobStart(context: Context, arguments: std.json.ObjectMap) Error!std.json.Valu
 }
 
 fn jobRead(context: Context, arguments: std.json.ObjectMap) Error!std.json.Value {
-    const result = try jobs.read(context.init.io, context.allocator, context.policy, context.state_dir, .{
+    const result = try jobs.read(context.init.io, context.allocator, context.policy, .{
         .job_id = try requiredString(arguments, "job_id"),
         .stdout_offset = try optionalNonNegativeInt(arguments, "stdout_offset", 0),
         .stderr_offset = try optionalNonNegativeInt(arguments, "stderr_offset", 0),
@@ -354,7 +352,6 @@ fn jobCancel(context: Context, arguments: std.json.ObjectMap) Error!std.json.Val
         context.init.io,
         context.allocator,
         context.policy,
-        context.state_dir,
         try requiredString(arguments, "job_id"),
     );
     var output = (try metaValue(context.allocator, result.meta)).object;
@@ -464,7 +461,7 @@ fn validateOptionalStdin(arguments: std.json.ObjectMap) Error!void {
 
 fn validatePath(arguments: std.json.ObjectMap, name: []const u8) Error!void {
     const value = try requiredString(arguments, name);
-    if (value.len > state.max_path_bytes) return error.InvalidArguments;
+    if (value.len > support.max_path_bytes) return error.InvalidArguments;
 }
 
 fn validateJobId(arguments: std.json.ObjectMap) Error!void {
@@ -932,7 +929,6 @@ test "job catalogue is Walker-only and admits portable typed resources" {
     try std.testing.expect(std.mem.indexOf(u8, schema, "\"resources\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "cpu_weight") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "io_weight") != null);
-    try std.testing.expect(std.mem.indexOf(u8, schema, "systemd_properties") == null);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -975,7 +971,7 @@ test "process tools reject an unavailable working directory before spawn" {
         },
         .policy = test_policy,
         .allocator = allocator,
-        .state_dir = root,
+        .scratch_dir = root,
         .root = root,
     };
 
@@ -1018,7 +1014,7 @@ test "image read distinguishes missing read and size failures" {
         },
         .policy = test_policy,
         .allocator = allocator,
-        .state_dir = root,
+        .scratch_dir = root,
         .root = root,
     };
     var arguments = object();

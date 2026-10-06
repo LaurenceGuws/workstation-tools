@@ -104,7 +104,6 @@ class Contract(unittest.TestCase):
         self.assertIsNone(view["reconciled_at_ms"])
         r=self.call("job_read",dict(job_id=r["job_id"])); self.assertEqual(r["stdout"],"hello\n")
         self.assertTrue(r["stdout_eof"] and r["stderr_eof"])
-        self.assertNotIn("unit",r); self.assertNotIn("systemd_properties",r)
     def test_operator_observation_surface_is_v5_typed(self):
         r=self.start("import time; print('observe',flush=True); time.sleep(2)")
         run_id=r["job_id"]
@@ -129,18 +128,16 @@ class Contract(unittest.TestCase):
         terminal=self.observe("inspect",run_id)
         self.assertIsInstance(terminal["terminalized_at_ms"],int)
         self.assertIsNone(terminal["reconciled_at_ms"])
-    def test_no_systemd_or_container_exec_and_local_shell(self):
+    def test_selected_walker_owns_durable_launch_and_shell_stays_local(self):
         trace=self.root/"exec.log"
         r=self.call("job_start",dict(argv=["/usr/bin/printf","host-local"],cwd=str(self.root)),trace=trace)
         self.assertEqual(self.done(r["job_id"])["stdout"],"host-local")
-        executions=trace.read_text()
-        for executable in ("/usr/bin/systemctl", "/usr/bin/systemd-run", "/usr/bin/podman", "/usr/bin/docker"):
-            self.assertNotIn('execve("'+executable+'"',executions)
+        self.assertIn('execve("'+str(self.walker)+'"',trace.read_text())
         r=self.call("shell",dict(command="printf local-shell",cwd=str(self.root)))
         self.assertEqual(r["stdout"],"local-shell")
-    def test_missing_walker_fails_without_fallback(self):
+    def test_missing_walker_fails_before_launch(self):
         r=self.call("job_start",dict(argv=["/usr/bin/true"],cwd=str(self.root)),ok=False,walker=self.root/"missing")
-        self.assertEqual(r["error"],"WalkerUnavailable"); self.assertFalse((self.state/"jobs").exists())
+        self.assertEqual(r["error"],"WalkerUnavailable"); self.assertFalse(self.state.exists())
     def test_nondurable_walker_rejected_before_job_state(self):
         other=self.root/"nondurable-home"
         other_env=dict(self.env,WALKER_HOME=str(other))
@@ -158,7 +155,7 @@ class Contract(unittest.TestCase):
                 home=other,
             )
             self.assertEqual(r["error"],"WalkerDurabilityUnavailable")
-            self.assertFalse((self.state/"jobs").exists())
+            self.assertFalse(self.state.exists())
         finally:
             subprocess.run([str(self.walker),"stop",direct["run_id"]],env=other_env,capture_output=True)
     def test_timeout_after_closed_output(self):
@@ -181,14 +178,15 @@ class Contract(unittest.TestCase):
     def test_full_stdin_and_environment_not_retained(self):
         r=self.start("import sys; print(len(sys.stdin.buffer.read()))",stdin="z"*(128*1024))
         self.assertEqual(self.done(r["job_id"])["stdout"],"131072\n")
-        self.assertFalse((self.state/"jobs"/r["job_id"]/"stdin").exists())
+        inputs=self.state/"workstation-inputs"
+        self.assertFalse(inputs.exists() and any(inputs.iterdir()))
         self.assertFalse((self.home/"runs"/r["job_id"]/"stdin").exists())
     def test_full_argument_count_and_wrapper_overhead(self):
         args=["/usr/bin/printf","%s",*("x" for _ in range(254))]
         r=self.call("job_start",dict(argv=args,cwd=str(self.root)))
         self.assertEqual(self.done(r["job_id"])["stdout"],"x"*254)
-    def test_systemd_options_are_not_admitted(self):
-        r=self.call("job_start",dict(argv=["/usr/bin/true"],cwd=str(self.root),systemd_properties=[]),ok=False)
+    def test_unknown_job_option_is_rejected(self):
+        r=self.call("job_start",dict(argv=["/usr/bin/true"],cwd=str(self.root),unexpected_option=[]),ok=False)
         self.assertEqual(r["error"],"InvalidArguments")
     def test_typed_resources_round_trip_through_walker(self):
         if not all(self.resource_controls.get(key) for key in (
@@ -232,8 +230,7 @@ sys.stdout.buffer.write(r.stdout); sys.stderr.buffer.write(r.stderr); sys.exit(r
             walker=shim,
         )
         self.assertEqual(r["error"],"WalkerResourceUnavailable")
-        jobs=self.state/"jobs"
-        self.assertFalse(jobs.exists() and any(jobs.iterdir()))
+        self.assertFalse(self.state.exists())
     def test_lost_launch_ack_retains_id_and_does_not_replay(self):
         shim=self.root/"lost-ack"
         shim.write_text(f"""#!/usr/bin/python3
@@ -251,7 +248,7 @@ sys.exit(r.returncode)
         r=self.call("job_start",dict(argv=["/bin/sh","-c","printf x >> count"],cwd=str(self.root)),walker=shim)
         self.assertEqual(r["state"],"indeterminate")
         id=r["job_id"]
-        self.assertTrue((self.state/"jobs"/id/"request.json").exists())
+        self.assertFalse(self.state.exists())
         time.sleep(.2)
         self.assertEqual((self.root/"count").read_text(),"x")
         view=json.loads(subprocess.check_output([str(self.walker),"inspect",id],env=self.env))["animal"]
@@ -268,8 +265,7 @@ os.execv({str(self.walker)!r},[{str(self.walker)!r},*sys.argv[1:]])
         shim.chmod(0o700)
         r=self.call("job_start",dict(argv=["/usr/bin/true"],cwd=str(self.root)),ok=False,walker=shim)
         self.assertEqual(r["error"],"WalkerDurabilityUnavailable")
-        jobs=self.state/"jobs"
-        self.assertFalse(jobs.exists() and any(jobs.iterdir()),"known-not-run failure retained unreachable job binding")
+        self.assertFalse(self.state.exists(),"known-not-run failure created consumer job state")
     def test_unversioned_mutation_failure_is_submission_uncertain(self):
         shim=self.root/"unversioned-run-error"
         shim.write_text(f"""#!/usr/bin/python3
@@ -282,7 +278,7 @@ os.execv({str(self.walker)!r},[{str(self.walker)!r},*sys.argv[1:]])
         shim.chmod(0o700)
         r=self.call("job_start",dict(argv=["/bin/sh","-c","printf SHOULD_NOT_RUN >> marker"],cwd=str(self.root)),walker=shim)
         self.assertEqual(r["state"],"indeterminate")
-        self.assertTrue((self.state/"jobs"/r["job_id"]/"request.json").is_file())
+        self.assertFalse(self.state.exists())
         self.assertFalse((self.root/"marker").exists())
     def test_valid_older_walker_ping_is_nondurable_not_malformed(self):
         shim=self.root/"walker-v4-ping"
@@ -296,9 +292,8 @@ os.execv({str(self.walker)!r},[{str(self.walker)!r},*sys.argv[1:]])
         shim.chmod(0o700)
         r=self.call("job_start",dict(argv=["/usr/bin/true"],cwd=str(self.root)),ok=False,walker=shim)
         self.assertEqual(r["error"],"WalkerDurabilityUnavailable")
-        jobs=self.state/"jobs"
-        self.assertFalse(jobs.exists() and any(jobs.iterdir()))
-    def test_platform_owner_crash_reconciles_without_fallback(self):
+        self.assertFalse(self.state.exists())
+    def test_platform_owner_crash_reconciles_by_walker_identity(self):
         r=self.start("import time; time.sleep(20)")
         v=json.loads(subprocess.check_output([str(self.walker),"inspect",r["job_id"]],env=self.env))["animal"]
         os.kill(v["walker_pid"],signal.SIGKILL); time.sleep(.1)
