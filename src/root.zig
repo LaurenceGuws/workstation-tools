@@ -106,6 +106,45 @@ pub const Context = struct {
     root: []const u8,
 };
 
+/// Resolves one executable exactly against the environment recipe used by
+/// command/shell execution. Absolute paths are validated directly; bare names
+/// are resolved through the normalized child PATH.
+pub fn resolveExecutable(
+    init: std.process.Init,
+    allocator: Allocator,
+    policy: Policy,
+    cwd: []const u8,
+    name: []const u8,
+) Error![]const u8 {
+    try policy.validate();
+    if (name.len == 0 or !std.fs.path.isAbsolute(cwd))
+        return error.InvalidArguments;
+
+    if (std.mem.indexOfScalar(u8, name, '/') != null) {
+        if (!std.fs.path.isAbsolute(name)) return error.InvalidArguments;
+        const stat = Io.Dir.cwd().statFile(init.io, name, .{}) catch
+            return error.CommandNotFound;
+        if (stat.kind != .file) return error.CommandNotFound;
+        Io.Dir.accessAbsolute(init.io, name, .{ .execute = true }) catch
+            return error.CommandNotFound;
+        return allocator.dupe(u8, name) catch error.OutOfMemory;
+    }
+
+    var child_env = try environment.current(
+        init,
+        init.gpa,
+        policy.operator_marker,
+    );
+    defer child_env.deinit();
+    return environment.resolveExecutable(
+        init.io,
+        allocator,
+        &child_env,
+        cwd,
+        name,
+    );
+}
+
 /// Executes one already validated tool and returns request-lifetime structured content.
 pub fn call(context: Context, tool: Tool, arguments: std.json.ObjectMap) Error!std.json.Value {
     try context.policy.validate();
@@ -1105,6 +1144,41 @@ test "workstation shell guard cannot persist Bash history" {
     );
     defer std.testing.allocator.free(after);
     try std.testing.expectEqualStrings("human-history\n", after);
+}
+
+test "public executable resolution validates exact absolute commands" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    const init = std.process.Init{
+        .minimal = undefined,
+        .arena = &arena,
+        .gpa = std.testing.allocator,
+        .io = std.testing.io,
+        .environ_map = &environ,
+        .preopens = undefined,
+    };
+    const path = try resolveExecutable(
+        init,
+        std.testing.allocator,
+        test_policy,
+        "/",
+        "/usr/bin/true",
+    );
+    defer std.testing.allocator.free(path);
+    try std.testing.expectEqualStrings("/usr/bin/true", path);
+    try std.testing.expectError(
+        error.InvalidArguments,
+        resolveExecutable(
+            init,
+            std.testing.allocator,
+            test_policy,
+            "/",
+            "./true",
+        ),
+    );
 }
 
 test "tool output preserves text schema for binary bytes and split UTF-8" {
