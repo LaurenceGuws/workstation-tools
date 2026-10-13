@@ -51,6 +51,15 @@ pub const Result = struct {
     }
 };
 
+/// Optional, synchronous observation of a bounded process's output. The
+/// callback borrows bytes only during this call. It must not block process
+/// draining or retain the slice. No application/session concepts live here.
+pub const Stream = enum { stdout, stderr };
+pub const Observer = struct {
+    context: *anyopaque,
+    output: *const fn (context: *anyopaque, stream: Stream, bytes: []const u8) void,
+};
+
 /// Runs one local process group to completion with one absolute timeout and bounded retained streams.
 pub fn run(
     allocator: Allocator,
@@ -62,6 +71,21 @@ pub fn run(
     environ_map: ?*const std.process.Environ.Map,
 ) Error!Result {
     return runWithBudget(allocator, io, argv, cwd, stdin, timeout, environ_map, .{});
+}
+
+/// Like run, but reports output as it is drained. Existing callers retain
+/// their exact run() contract and never need an observer.
+pub fn runObserved(
+    allocator: Allocator,
+    io: Io,
+    argv: []const []const u8,
+    cwd: []const u8,
+    stdin: ?[]const u8,
+    timeout: Io.Duration,
+    environ_map: ?*const std.process.Environ.Map,
+    observer: Observer,
+) Error!Result {
+    return runWithBudgetObserved(allocator, io, argv, cwd, stdin, timeout, environ_map, .{}, observer);
 }
 
 /// Internal command wrapper budget. Payload admission must happen before adding wrapper arguments.
@@ -77,6 +101,20 @@ pub fn runWithBudget(
     timeout: Io.Duration,
     environ_map: ?*const std.process.Environ.Map,
     budget: CommandBudget,
+) Error!Result {
+    return runWithBudgetObserved(allocator, io, argv, cwd, stdin, timeout, environ_map, budget, null);
+}
+
+fn runWithBudgetObserved(
+    allocator: Allocator,
+    io: Io,
+    argv: []const []const u8,
+    cwd: []const u8,
+    stdin: ?[]const u8,
+    timeout: Io.Duration,
+    environ_map: ?*const std.process.Environ.Map,
+    budget: CommandBudget,
+    observer: ?Observer,
 ) Error!Result {
     if (comptime builtin.os.tag != .linux) return error.UnsupportedPlatform;
     if (argv.len == 0 or argv.len > budget.arguments or cwd.len == 0) return error.InvalidInvocation;
@@ -132,8 +170,8 @@ pub fn runWithBudget(
     while (true) {
         reader.fill(64, .{ .deadline = drain_deadline orelse deadline }) catch |failure| switch (failure) {
             error.EndOfStream => {
-                try retainBounded(&stdout_retained, stdout, &truncated);
-                try retainBounded(&stderr_retained, stderr, &truncated);
+                try retainBounded(&stdout_retained, stdout, &truncated, observer, .stdout);
+                try retainBounded(&stderr_retained, stderr, &truncated, observer, .stderr);
                 break;
             },
             error.Timeout => {
@@ -148,8 +186,8 @@ pub fn runWithBudget(
             },
             else => return error.StreamFailed,
         };
-        try retainBounded(&stdout_retained, stdout, &truncated);
-        try retainBounded(&stderr_retained, stderr, &truncated);
+        try retainBounded(&stdout_retained, stdout, &truncated, observer, .stdout);
+        try retainBounded(&stderr_retained, stderr, &truncated, observer, .stderr);
         if (!timed_out and deadline.untilNow(io).raw.nanoseconds >= 0) {
             timed_out = true;
             drain_deadline = Io.Clock.Timestamp.fromNow(io, .{ .raw = .fromSeconds(1), .clock = .awake });
@@ -208,11 +246,12 @@ fn writeInput(io: Io, file: Io.File, bytes: []const u8) Io.File.Writer.Error!voi
     try file.writeStreamingAll(io, bytes);
 }
 
-fn retainBounded(output: *Io.Writer.Allocating, input: *Io.Reader, truncated: *bool) Error!void {
+fn retainBounded(output: *Io.Writer.Allocating, input: *Io.Reader, truncated: *bool, observer: ?Observer, stream: Stream) Error!void {
     const bytes = input.buffered();
     const remaining = max_stream_bytes - output.writer.buffered().len;
     const retained = @min(bytes.len, remaining);
     output.writer.writeAll(bytes[0..retained]) catch return error.OutOfMemory;
+    if (observer) |sink| if (retained != 0) sink.output(sink.context, stream, bytes[0..retained]);
     if (retained != bytes.len) truncated.* = true;
     input.tossBuffered();
 }
@@ -364,4 +403,46 @@ test "unsupported platforms reject process execution explicitly" {
         error.UnsupportedPlatform,
         run(std.testing.allocator, std.testing.io, &.{"not-launched"}, ".", null, .fromSeconds(1), null),
     );
+}
+
+test "optional observer reports both streams without changing bounded result" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const Capture = struct {
+        stdout: std.ArrayList(u8) = .empty,
+        stderr: std.ArrayList(u8) = .empty,
+        allocator: Allocator,
+        failed: bool = false,
+        fn observe(ctx: *anyopaque, stream: Stream, bytes: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const target = switch (stream) {
+                .stdout => &self.stdout,
+                .stderr => &self.stderr,
+            };
+            target.appendSlice(self.allocator, bytes) catch {
+                self.failed = true;
+            };
+        }
+    };
+    const allocator = std.testing.allocator;
+    var seen = Capture{ .allocator = allocator };
+    defer seen.stdout.deinit(allocator);
+    defer seen.stderr.deinit(allocator);
+    var result = try runObserved(
+        allocator,
+        std.testing.io,
+        &.{ "/bin/sh", "-c", "printf 'begin\\n'; sleep 0.1; printf 'end\\n'; printf 'warning\\n' >&2" },
+        "/",
+        null,
+        .fromSeconds(3),
+        null,
+        .{ .context = &seen, .output = Capture.observe },
+    );
+    defer result.deinit(allocator);
+    try std.testing.expect(!seen.failed);
+    try std.testing.expectEqualStrings("begin\nend\n", seen.stdout.items);
+    try std.testing.expectEqualStrings("warning\n", seen.stderr.items);
+    try std.testing.expectEqualStrings(result.stdout, seen.stdout.items);
+    try std.testing.expectEqualStrings(result.stderr, seen.stderr.items);
+    try std.testing.expect(!result.truncated);
+    try std.testing.expectEqual(@as(u8, 0), result.term.?.exited);
 }
