@@ -74,6 +74,12 @@ Use the exact Zig revision declared by .zigversion and build.zig.zon.
     zig build check
     zig build test
 
+`zig build check` compiles the module and runs both independent source gates:
+`tools/audit_source.sh` retains the project-specific owner, line-width, pin,
+and consumer-neutrality checks, while `zig-audit check` enforces schema 2,
+ruleset 3 over `build.zig`, maintained `src/*.zig`, and both Zig test drivers.
+The `zig-audit` executable must be on PATH. Neither gate uses a findings baseline.
+
 The live Walker contract uses an explicitly installed platform-owned Walker:
 
     zig build walker-driver -Doptimize=ReleaseSafe

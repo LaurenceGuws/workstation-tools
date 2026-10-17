@@ -15,21 +15,31 @@ const host_policy = @import("policy.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
+/// Default Walker workload lifetime when the request omits a timeout (6 hours).
 pub const default_timeout_seconds: u32 = 6 * 60 * 60;
+/// Hard upper limit on an admitted durable workload (24 hours).
 pub const max_timeout_seconds: u32 = 24 * 60 * 60;
+/// Default retained output budget per Walker stream (1 MiB).
 pub const default_output_limit_bytes: usize = 1024 * 1024;
+/// Walker refuses output retention smaller than 4 KiB per stream.
 pub const min_output_limit_bytes: usize = 4096;
+/// Maximum retained output per Walker stream (512 MiB).
 pub const max_output_limit_bytes: usize = 512 * 1024 * 1024;
+/// Maximum combined bytes in one incremental Walker log read (32 KiB).
 pub const max_read_bytes: usize = 32 * 1024;
+/// Minimum combined bytes in one incremental Walker log read (2 bytes).
 pub const min_read_bytes: usize = 2;
+/// Default combined incremental log read budget (24 KiB).
 pub const default_read_bytes: usize = 24 * 1024;
 
+/// Closed error union for admission, Walker access, and finite stdin handoff.
 pub const Error = support.Error || environment.Error || walker.Error || error{
     InvalidPolicy,
     InvalidJob,
     JobCreateFailed,
 };
 
+/// Borrowed process invocation and optional resource limits; validated before Walker submission.
 pub const StartRequest = struct {
     argv: []const []const u8,
     cwd: []const u8,
@@ -39,6 +49,7 @@ pub const StartRequest = struct {
     resources: resources.Values = .{},
 };
 
+/// Portable Walker state mapping, including indeterminate admission without a replay.
 pub const JobState = enum {
     starting,
     running,
@@ -50,6 +61,7 @@ pub const JobState = enum {
     indeterminate,
 };
 
+/// Workload receipt; job_id is the exact Walker run ID, and inspection fields come from Walker.
 pub const Meta = struct {
     job_id: []const u8,
     state: JobState,
@@ -65,6 +77,7 @@ pub const Meta = struct {
     ended_at: ?i64 = null,
 };
 
+/// Walker run identity and per-stream byte cursors, not text-character offsets.
 pub const ReadRequest = struct {
     job_id: []const u8,
     stdout_offset: usize = 0,
@@ -72,6 +85,7 @@ pub const ReadRequest = struct {
     max_bytes: usize = default_read_bytes,
 };
 
+/// Walker metadata plus original-byte stream windows; slices belong to the caller allocator.
 pub const ReadResult = struct {
     meta: Meta,
     stdout: []const u8,
@@ -84,7 +98,9 @@ pub const ReadResult = struct {
     stderr_eof: bool,
 };
 
+/// Distinguishes a newly requested stop from a workload already terminal.
 pub const CancelReason = enum { already_finished, stop_requested };
+/// Observed post-stop state plus whether Walker accepted a new cancellation request.
 pub const CancelResult = struct {
     meta: Meta,
     cancelled: bool,
@@ -114,6 +130,13 @@ pub fn start(
 
     var input_dir_buffer: [support.max_path_bytes]u8 = undefined;
     var input_path_buffer: [support.max_path_bytes]u8 = undefined;
+    var input_dir: ?[]const u8 = null;
+    // Once Walker has been asked to launch, losing its run ID is worse than a scratch cleanup
+    // failure: preserve the admission result and report failed removal for operator repair.
+    defer if (input_dir) |directory| {
+        Io.Dir.cwd().deleteTree(init.io, directory) catch |failure|
+            std.log.err("durable stdin scratch cleanup failed for {s}: {s}", .{ directory, @errorName(failure) });
+    };
     const input_path = if (request.stdin) |bytes| blk: {
         if (scratch_dir.len == 0 or scratch_dir.len > support.max_path_bytes)
             return error.InvalidJob;
@@ -133,7 +156,7 @@ pub fn start(
             parent,
             directory,
         ) catch return error.JobCreateFailed;
-        errdefer Io.Dir.cwd().deleteTree(init.io, directory) catch {};
+        input_dir = directory;
         const path = std.fmt.bufPrint(
             &input_path_buffer,
             "{s}/stdin",
@@ -142,11 +165,6 @@ pub fn start(
         try support.writeScratchFile(init.io, path, bytes);
         break :blk path;
     } else null;
-    defer if (request.stdin != null)
-        Io.Dir.cwd().deleteTree(
-            init.io,
-            std.fs.path.dirname(input_path.?) orelse unreachable,
-        ) catch {};
 
     var env = try environment.current(
         init,
@@ -188,7 +206,7 @@ pub fn read(
     request: ReadRequest,
 ) Error!ReadResult {
     try policy.validate();
-    if (!validId(request.job_id) or
+    if (!walker.validRunId(request.job_id) or
         request.max_bytes < min_read_bytes or
         request.max_bytes > max_read_bytes)
     {
@@ -226,7 +244,7 @@ pub fn cancel(
     job_id: []const u8,
 ) Error!CancelResult {
     try policy.validate();
-    if (!validId(job_id)) return error.InvalidJob;
+    if (!walker.validRunId(job_id)) return error.InvalidJob;
 
     const ref = try walkerRef(allocator, policy, job_id);
     const requested = try walker.stop(io, allocator, ref);
@@ -283,7 +301,7 @@ fn walkerRef(
     policy: host_policy.Policy,
     job_id: []const u8,
 ) Error!walker.Ref {
-    if (!validId(job_id)) return error.InvalidJob;
+    if (!walker.validRunId(job_id)) return error.InvalidJob;
     return .{
         .config = policy.walker,
         .run_id = job_id,
@@ -357,17 +375,6 @@ fn startingMeta(
     };
 }
 
-fn validId(id: []const u8) bool {
-    if (id.len != 32) return false;
-    for (id) |byte|
-        if (!std.ascii.isHex(byte) or
-            std.ascii.isUpper(byte))
-        {
-            return false;
-        };
-    return true;
-}
-
 const test_policy = host_policy.Policy{
     .walker = .{
         .executable = "/selected/walker",
@@ -380,13 +387,13 @@ const test_policy = host_policy.Policy{
 };
 
 test "job id validation accepts only canonical lowercase hex" {
-    try std.testing.expect(validId(
+    try std.testing.expect(walker.validRunId(
         "0123456789abcdef0123456789abcdef",
     ));
-    try std.testing.expect(!validId(
+    try std.testing.expect(!walker.validRunId(
         "0123456789ABCDEF0123456789ABCDEF",
     ));
-    try std.testing.expect(!validId("short"));
+    try std.testing.expect(!walker.validRunId("short"));
 }
 
 test "durable job stdin admission matches the shared process bound" {

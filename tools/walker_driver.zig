@@ -1,6 +1,7 @@
 //! Test-only caller of the public workstation tool contract; no model or transport shortcut is installed.
 const std = @import("std");
 const tools = @import("workstation_tools");
+/// Test-only CLI entrypoint for invoking the public workstation tool vocabulary through one host policy.
 pub fn main(init: std.process.Init) void {
     run(init) catch |failure| {
         std.debug.print("{{\"error\":\"{s}\"}}\n", .{@errorName(failure)});
@@ -21,7 +22,13 @@ fn run(init: std.process.Init) !void {
     const request = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
     if (request != .object) return error.InvalidArguments;
     try tools.validateArguments(tool, request.object);
-    const result = try tools.call(.{ .init = init, .policy = policy, .allocator = a, .scratch_dir = args[3], .root = "/" }, tool, request.object);
+    const result = try tools.call(.{
+        .init = init,
+        .policy = policy,
+        .allocator = a,
+        .scratch_dir = args[3],
+        .root = "/",
+    }, tool, request.object);
     var buf: [4096]u8 = undefined;
     var out = std.Io.File.stdout().writer(init.io, &buf);
     try std.json.Stringify.value(result, .{}, &out.interface);

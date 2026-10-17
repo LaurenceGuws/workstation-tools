@@ -3,10 +3,14 @@
 const std = @import("std");
 const environment = @import("environment.zig");
 
+/// Maximum host-provided Bash prelude bytes reserved inside the bounded argv budget.
 pub const max_shell_prelude_bytes: usize = 62;
+/// Maximum bytes in a portable Walker workload-name prefix.
 pub const max_job_name_prefix_bytes: usize = 32;
+/// Exact Walker executable and state namespace; never resolved implicitly from PATH.
 pub const WalkerConfig = @import("walker.zig").Config;
 
+/// Host-supplied execution binding; the module neither discovers nor chooses the Walker owner.
 pub const Policy = struct {
     walker: WalkerConfig,
     agent_marker: ?environment.Marker = null,
@@ -14,6 +18,7 @@ pub const Policy = struct {
     shell_prelude: []const u8 = "declare -xr HISTFILE=/dev/null;set +o history;",
     job_name_prefix: []const u8,
 
+    /// Rejects invalid Walker paths, environment marker values, shell budgets and workload names.
     pub fn validate(self: Policy) error{InvalidPolicy}!void {
         if (!@import("walker.zig").validConfig(self.walker)) return error.InvalidPolicy;
         if (self.shell_prelude.len > max_shell_prelude_bytes) return error.InvalidPolicy;

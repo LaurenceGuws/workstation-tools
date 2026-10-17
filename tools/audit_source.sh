@@ -2,7 +2,7 @@
 set -euo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 cd "$root"
-sources=(build.zig src/*.zig)
+sources=(build.zig src/*.zig tools/*.zig)
 fail() { printf 'source audit: %s\n' "$*" >&2; exit 1; }
 [[ $(<.zigversion) == "$(sed -n 's/.*\.minimum_zig_version = "\([^"]*\)".*/\1/p' build.zig.zon)" ]] || fail 'Zig pins disagree'
 for file in "${sources[@]}"; do [[ $(head -n 1 "$file") == '//!'* ]] || fail "$file lacks owner documentation"; done

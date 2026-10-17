@@ -57,6 +57,7 @@ pub const max_shell_command_bytes: usize =
 
 /// Host execution policy supplied by the embedding application or transport.
 pub const Policy = host_policy.Policy;
+/// Consumer-supplied binding to the one Walker binary and durable state root.
 pub const WalkerConfig = host_policy.WalkerConfig;
 /// Typed CLI observation for operator clients; this does not add model-facing tools.
 pub const Walker = @import("walker.zig");
@@ -221,6 +222,8 @@ pub fn validateArguments(tool: Tool, arguments: std.json.ObjectMap) Error!void {
             if (output_limit < jobs.min_output_limit_bytes or output_limit > jobs.max_output_limit_bytes) {
                 return error.InvalidArguments;
             }
+            // zig-audit: acknowledge discard
+            // reason: This checks resource syntax; jobStart later obtains the typed values for Walker.
             _ = try optionalResources(arguments);
         },
         .job_read => {
@@ -329,9 +332,9 @@ fn imageRead(context: Context, arguments: std.json.ObjectMap) Error!std.json.Val
             else => return error.FileReadFailed,
         };
     if (!validImageBytes(mime, bytes)) return error.InvalidImageData;
-    const encoded = context.allocator.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len)) catch
+    const encoded_storage = context.allocator.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len)) catch
         return error.OutOfMemory;
-    _ = std.base64.standard.Encoder.encode(encoded, bytes);
+    const encoded = std.base64.standard.Encoder.encode(encoded_storage, bytes);
     var image = object();
     try put(context.allocator, &image, "type", .{ .string = "image" });
     try put(context.allocator, &image, "data", .{ .string = encoded });
@@ -683,7 +686,7 @@ pub fn outputText(allocator: Allocator, bytes: []const u8) Error![]u8 {
 fn validUtf8Prefix(bytes: []const u8) ?usize {
     const width = std.unicode.utf8ByteSequenceLength(bytes[0]) catch return null;
     if (width > bytes.len) return null;
-    _ = std.unicode.utf8Decode(bytes[0..width]) catch return null;
+    if (!std.unicode.utf8ValidateSlice(bytes[0..width])) return null;
     return width;
 }
 

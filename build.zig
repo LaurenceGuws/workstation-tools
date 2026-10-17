@@ -53,9 +53,12 @@ pub fn build(b: *std.Build) void {
     b.step("check-compile", "Compile workstation tool tests without the host source audit").dependOn(&tests.step);
     const audit_run = b.addSystemCommand(&.{ "bash", "tools/audit_source.sh" });
     audit_run.setCwd(b.path("."));
+    const shared_audit = b.addSystemCommand(&.{ "zig-audit", "check", "--config", ".zig-audit.json" });
+    shared_audit.setCwd(b.path("."));
     const check = b.step("check", "Compile and audit workstation tools and tests");
     check.dependOn(&tests.step);
     check.dependOn(&audit_run.step);
+    check.dependOn(&shared_audit.step);
     const test_step = b.step("test", "Run workstation tool tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
 }

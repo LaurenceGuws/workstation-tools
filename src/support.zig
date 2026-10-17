@@ -29,7 +29,9 @@ pub fn timestamp(io: Io) i64 {
 pub fn hashHex(bytes: []const u8, out: *[64]u8) []const u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-    return std.fmt.bufPrint(out, "{x}", .{digest}) catch unreachable;
+    // A SHA-256 digest has exactly 32 bytes: its hexadecimal form fills all 64 output bytes.
+    out.* = std.fmt.bytesToHex(digest, .lower);
+    return out;
 }
 
 /// Fills an even-length destination with cryptographically random lowercase hex.
@@ -38,8 +40,11 @@ pub fn randomHex(io: Io, out: []u8) void {
     var bytes: [32]u8 = undefined;
     const count = out.len / 2;
     io.random(bytes[0..count]);
-    _ = std.fmt.bufPrint(out, "{x}", .{bytes[0..count]}) catch
-        unreachable;
+    const hex = "0123456789abcdef";
+    for (bytes[0..count], 0..) |byte, i| {
+        out[2 * i] = hex[byte >> 4];
+        out[2 * i + 1] = hex[byte & 0x0f];
+    }
 }
 
 /// Resolves one relative workstation path against the consumer root.
@@ -115,4 +120,17 @@ fn ensureDirectory(io: Io, path: []const u8) Error!void {
 fn directoryExists(io: Io, path: []const u8) bool {
     const stat = Io.Dir.cwd().statFile(io, path, .{}) catch return false;
     return stat.kind == .directory;
+}
+
+test "fixed and variable hexadecimal encoders have exact lowercase output" {
+    var digest: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        hashHex("abc", &digest),
+    );
+    var random: [32]u8 = undefined;
+    randomHex(std.testing.io, &random);
+    for (random) |byte| {
+        try std.testing.expect(std.ascii.isDigit(byte) or (byte >= 'a' and byte <= 'f'));
+    }
 }

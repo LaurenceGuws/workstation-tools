@@ -55,8 +55,13 @@ pub const Result = struct {
 /// callback borrows bytes only during this call. It must not block process
 /// draining or retain the slice. No application/session concepts live here.
 pub const Stream = enum { stdout, stderr };
+/// Caller-owned callback state; context must remain alive and correctly typed until runObserved returns.
 pub const Observer = struct {
+    // zig-audit: acknowledge anyopaque
+    // reason: The non-generic public observer borrows caller-owned state; matching callback and context type are the caller contract.
     context: *anyopaque,
+    // zig-audit: acknowledge anyopaque
+    // reason: The callback receives exactly the opaque context supplied with this observer; a mismatched function is unsafe.
     output: *const fn (context: *anyopaque, stream: Stream, bytes: []const u8) void,
 };
 
@@ -150,6 +155,8 @@ fn runWithBudgetObserved(
         break :task io.concurrent(writeInput, .{ io, input, bytes }) catch return error.StdinWriteFailed;
     } else null;
     defer {
+        // zig-audit: acknowledge empty_catch
+        // reason: Defer only reaps/cancels the writer after any return path; the primary stream/spawn error must remain authoritative.
         if (input_task) |*task| task.cancel(io) catch {};
     }
 
@@ -202,6 +209,8 @@ fn runWithBudgetObserved(
     const term = try waitBounded(&child, io, drain_deadline orelse deadline);
     if (term == null) timed_out = true;
     if (input_task) |*task| {
+        // zig-audit: acknowledge empty_catch
+        // reason: The caller already receives timed_out and no exit status; canceled or broken stdin cannot change that outcome.
         if (timed_out) task.cancel(io) catch {} else task.await(io) catch return error.StdinWriteFailed;
     }
     const stdout_copy = stdout_retained.toOwnedSlice() catch return error.OutOfMemory;
@@ -263,7 +272,12 @@ fn signalGroup(pid: std.posix.pid_t, signal: std.posix.SIG) std.posix.KillError!
 
 fn terminateGroup(child: *std.process.Child, io: Io) void {
     const pid: std.posix.pid_t = @intCast(child.id orelse return);
-    signalGroup(pid, .KILL) catch {};
+    // An absent group has already exited. Other signal failures could leave descendants alive;
+    // always reap the leader but expose failed group cleanup for operator intervention.
+    signalGroup(pid, .KILL) catch |failure| switch (failure) {
+        error.ProcessNotFound => {},
+        else => std.log.err("process group {d} kill failed: {s}", .{ pid, @errorName(failure) }),
+    };
     child.kill(io);
 }
 
@@ -412,7 +426,13 @@ test "optional observer reports both streams without changing bounded result" {
         stderr: std.ArrayList(u8) = .empty,
         allocator: Allocator,
         failed: bool = false,
+        // zig-audit: acknowledge anyopaque
+        // reason: Test callback implements Observer.output and receives only the Capture pointer supplied by this same test.
         fn observe(ctx: *anyopaque, stream: Stream, bytes: []const u8) void {
+            // zig-audit: acknowledge ptr_cast
+            // reason: Observer.context is &seen of exactly this Capture type; a mismatch corrupts memory.
+            // zig-audit: acknowledge align_cast
+            // reason: Capture is stack-aligned for its type; synchronous observation ends before its lifetime.
             const self: *@This() = @ptrCast(@alignCast(ctx));
             const target = switch (stream) {
                 .stdout => &self.stdout,

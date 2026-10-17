@@ -74,6 +74,8 @@ pub fn current(
     if (shell_env.get("HOME") == null or shell_env.get("PATH") == null)
         return error.InvalidSessionEnvironment;
     try shell_env.put("HISTFILE", "/dev/null");
+    // zig-audit: acknowledge discard
+    // reason: swapRemove releases the map-owned key/value; only absence in the returned child environment matters, not the boolean.
     if (operator_marker) |marker| _ = shell_env.swapRemove(marker.name);
 
     env.deinit();

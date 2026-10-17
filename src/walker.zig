@@ -6,8 +6,11 @@ const support = @import("support.zig");
 const Io = std.Io;
 const A = std.mem.Allocator;
 
+/// Absolute executable and absolute Walker state root selected by the embedding host.
 pub const Config = struct { executable: []const u8, home: []const u8 };
+/// Exact workload address: selected Walker namespace plus stable run ID and derived name.
 pub const Ref = struct { config: Config, run_id: []const u8, name: []const u8 };
+/// Closed failures for Walker transport, durability, ownership and invalid wire receipts.
 pub const Error = process.Error || support.Error || error{
     WalkerUnavailable,
     WalkerDurabilityUnavailable,
@@ -20,7 +23,9 @@ pub const Error = process.Error || support.Error || error{
     OffsetOutOfRange,
     JobNotFound,
 };
+/// States accepted from the versioned Walker workload protocol, including indeterminate.
 pub const State = enum { starting, running, stopping, exited, stopped, timed_out, failed, indeterminate };
+/// Typed walker.run/v5 receipt; strings and argv borrow caller-owned decoded JSON storage.
 pub const Meta = struct {
     schema: []const u8,
     run_id: []const u8,
@@ -38,7 +43,9 @@ pub const Meta = struct {
     stderr_discarded_bytes: ?u64 = 0,
     resources_requested: resources.Values = .{},
 };
+/// Raw-byte Walker log window before UTF-8 or base64 decoding; offsets count bytes.
 pub const Slice = struct { encoding: []const u8, data: []const u8, next_offset: u64, eof: bool };
+/// Paired log slices with Walker run identity and versioned response framing.
 pub const Logs = struct {
     schema: []const u8,
     ok: bool,
@@ -48,6 +55,7 @@ pub const Logs = struct {
     stderr: Slice,
 };
 
+/// Accepts only bounded absolute paths without NUL; no PATH lookup or namespace fallback.
 pub fn validConfig(config: Config) bool {
     for ([_][]const u8{ config.executable, config.home }) |path| {
         if (!std.fs.path.isAbsolute(path) or path.len > support.max_path_bytes or
@@ -89,6 +97,7 @@ pub fn check(io: Io, a: A, config: Config, requested: resources.Values) Error!vo
         return error.WalkerResourceUnavailable;
 }
 
+/// Submits one preselected run ID; ambiguous acknowledgement returns WalkerSubmissionUncertain, never a replay.
 pub fn launch(
     io: Io,
     a: A,
@@ -146,6 +155,7 @@ pub fn launch(
         return error.WalkerSubmissionUncertain;
 }
 
+/// Reads and validates the exact Walker run ID, name and bounded execution metadata.
 pub fn inspect(io: Io, a: A, ref: Ref) Error!Meta {
     const bytes = try exchange(io, a, ref.config, &.{ "inspect", ref.run_id }, null, false);
     const reply = std.json.parseFromSliceLeaky(
@@ -159,6 +169,7 @@ pub fn inspect(io: Io, a: A, ref: Ref) Error!Meta {
     return reply.animal;
 }
 
+/// Reads bounded raw-byte windows; verifies each cursor and combined decoded byte budget.
 pub fn logs(io: Io, a: A, ref: Ref, stdout_offset: usize, stderr_offset: usize, max_bytes: usize) Error!Logs {
     const bytes = try exchange(io, a, ref.config, &.{
         "logs",
@@ -179,6 +190,7 @@ pub fn logs(io: Io, a: A, ref: Ref, stdout_offset: usize, stderr_offset: usize, 
     return reply;
 }
 
+/// Requests a stop from Walker; an uncertain reply must not be treated as successful cancellation.
 pub fn stop(io: Io, a: A, ref: Ref) Error!bool {
     const bytes = try exchange(io, a, ref.config, &.{ "stop", ref.run_id }, null, true);
     const reply = std.json.parseFromSliceLeaky(struct {
@@ -307,7 +319,9 @@ test "configuration requires exact absolute executable and state directory" {
 /// Host inventory is independent of agent admission history. All returned slices
 /// belong to the caller allocator, normally a request arena.
 pub const max_workloads = 512;
+/// Walker log-retention mode: original prefix or most recent bytes.
 pub const Retention = enum { prefix, recent };
+/// Bounded Walker ps entry with stable identity, command, state, and log-retention mode.
 pub const WorkloadSummary = struct {
     name: []const u8,
     run_id: []const u8,
@@ -318,6 +332,7 @@ pub const WorkloadSummary = struct {
     created_at_ms: i64,
     log_retention: Retention,
 };
+/// Full operator-visible Walker workload detail; typed fields mirror walker.run/v5.
 pub const Workload = struct {
     schema: []const u8,
     name: []const u8,
@@ -339,6 +354,7 @@ pub const Workload = struct {
     failure: ?[]const u8,
     streams_complete: bool,
 };
+/// Retained log window with byte offsets and explicit gap accounting for lost prefix bytes.
 pub const WindowSlice = struct {
     encoding: []const u8,
     data: []const u8,
@@ -350,6 +366,7 @@ pub const WindowSlice = struct {
     gap_bytes: u64,
     eof: bool,
 };
+/// Paired operator log windows; stream bytes must be decoded before presentation.
 pub const WorkloadLogs = struct {
     schema: []const u8,
     ok: bool,
@@ -361,6 +378,7 @@ pub const WorkloadLogs = struct {
     log_retention: Retention,
     streams_complete: bool,
 };
+/// Nullable CPU-time, scheduling and throttling measurements, all times in nanoseconds.
 pub const ResourceCpu = struct {
     running_ns: ?u64 = null,
     user_ns: ?u64 = null,
@@ -371,6 +389,7 @@ pub const ResourceCpu = struct {
     throttled_periods: ?u64 = null,
 };
 
+/// Nullable resident, virtual, charged and peak memory bytes; approximation flags are explicit.
 pub const ResourceMemory = struct {
     rss_bytes: ?u64 = null,
     virtual_bytes: ?u64 = null,
@@ -385,6 +404,7 @@ pub const ResourceMemory = struct {
     kernel_charged_bytes: ?u64 = null,
 };
 
+/// Nullable whole-workload I/O byte and operation counters.
 pub const ResourceIo = struct {
     read_bytes: ?u64 = null,
     write_bytes: ?u64 = null,
@@ -392,6 +412,7 @@ pub const ResourceIo = struct {
     write_operations: ?u64 = null,
 };
 
+/// Nullable memory and task controller event counts for a workload.
 pub const ResourceEvents = struct {
     memory_low: ?u64 = null,
     memory_high: ?u64 = null,
@@ -402,6 +423,7 @@ pub const ResourceEvents = struct {
     tasks_max: ?u64 = null,
 };
 
+/// Nullable cumulative CPU, memory and I/O pressure times in nanoseconds.
 pub const ResourcePressure = struct {
     cpu_some_ns: ?u64 = null,
     cpu_full_ns: ?u64 = null,
@@ -411,6 +433,7 @@ pub const ResourcePressure = struct {
     io_full_ns: ?u64 = null,
 };
 
+/// Typed resource snapshot; scope and partial flags qualify the meaning of optional counters.
 pub const Resources = struct {
     scope: []const u8,
     cumulative_for_run: bool,
@@ -430,6 +453,7 @@ pub const Resources = struct {
     pressure: ResourcePressure = .{},
 };
 
+/// One Walker workload sample with explicit sampling status and optional resource snapshot.
 pub const WorkloadStats = struct {
     run_id: []const u8,
     name: []const u8,
@@ -460,6 +484,7 @@ pub fn inventory(io: Io, a: A, config: Config) Error![]WorkloadSummary {
     return reply.animals;
 }
 
+/// Retrieves validated walker.run/v5 detail for one canonical ID, without reassigning ownership.
 pub fn inspectWorkload(io: Io, a: A, config: Config, id: []const u8) Error!Workload {
     if (!validRunId(id)) return error.JobNotFound;
     const bytes = try exchange(io, a, config, &.{ "inspect", id }, null, false);
@@ -511,6 +536,7 @@ pub fn workloadLogs(io: Io, a: A, ref: Ref, out: u64, err: u64, max_bytes: u32, 
     return reply;
 }
 
+/// Reads one matching Walker stats row and rejects incompatible resource-scope semantics.
 pub fn workloadStats(io: Io, a: A, ref: Ref) Error!WorkloadStats {
     if (!validRunId(ref.run_id) or !validName(ref.name)) return error.JobNotFound;
     const bytes = try exchange(io, a, ref.config, &.{ "stats", ref.run_id }, null, false);
@@ -594,6 +620,7 @@ fn decodeWindow(a: A, slice: WindowSlice, requested: ?u64, limit: usize) Error![
     }, std.math.cast(usize, slice.start_offset) orelse return error.WalkerInvalidResponse, limit);
 }
 
+/// Accepts exactly 32 lowercase ASCII hexadecimal characters, the stable Walker run-ID grammar.
 pub fn validRunId(id: []const u8) bool {
     if (id.len != 32) return false;
     for (id) |byte| if (!std.ascii.isDigit(byte) and (byte < 'a' or byte > 'f')) return false;

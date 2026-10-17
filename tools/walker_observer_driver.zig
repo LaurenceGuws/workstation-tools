@@ -2,6 +2,7 @@
 const std = @import("std");
 const tools = @import("workstation_tools");
 
+/// Test-only CLI entrypoint for typed Walker inventory, detail, logs, and statistics decoding.
 pub fn main(init: std.process.Init) void {
     run(init) catch |failure| {
         std.debug.print("{{\"error\":\"{s}\"}}\n", .{@errorName(failure)});
@@ -32,6 +33,8 @@ fn run(init: std.process.Init) !void {
     return error.InvalidArguments;
 }
 
+// zig-audit: acknowledge anytype
+// reason: The test driver instantiates this JSON emitter for four concrete Walker DTOs; no type erasure enters the runtime API.
 fn emit(io: std.Io, value: anytype) !void {
     var buffer: [4096]u8 = undefined;
     var out = std.Io.File.stdout().writer(io, &buffer);
